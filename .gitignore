@@ -1,0 +1,29 @@
+# Go
+bin/
+*.test
+coverage.out
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Build
+dist/
+build/
+
+# Generated
+*.pb.go
+*_grpc.pb.go
