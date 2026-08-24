@@ -1,0 +1,25 @@
+{
+  "video": "fake_02.mp4",
+  "frames": 328,
+  "faces_detected": 328,
+  "fake_mean": 0.0001921533839777112,
+  "fake_median": 2.2139774102925003e-07,
+  "fake_p75": 3.1268109523807652e-06,
+  "fake_p90": 6.428302731364965e-05,
+  "fake_max": 0.011882438324391842,
+  "fake_score": 2.9750194103428383e-05,
+  "embedding_frames": 328,
+  "embedding_consistency": {
+    "mean_similarity": 0.9879457354545593,
+    "median_similarity": 0.990257203578949,
+    "p10_similarity": 0.9798810482025146,
+    "min_similarity": 0.8708024024963379
+  },
+  "temporal_changes": {
+    "mean_change": 0.012054230086505413,
+    "median_change": 0.009742796421051025,
+    "p90_change": 0.02011892758309841,
+    "max_change": 0.1291975975036621,
+    "large_change_ratio": 0.0
+  }
+}
