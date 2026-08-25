@@ -3,5 +3,6 @@ go 1.26.3
 use (
 	./packages/go-kernel
 	./services/api-gateway
+	./services/gateway
 	./services/session-service
 )

@@ -1,0 +1,26 @@
+services:
+  video-detector:
+    build:
+      context: ../../services/video-detector
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  gateway:
+    build:
+      context: ../../services/gateway
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_DETECTOR_URL: http://video-detector:8000
+      # CPU-only inference inside the container (no MPS/GPU passthrough)
+      # is much slower than a host run, so this needs real headroom.
+      GATEWAY_DETECTOR_TIMEOUT: 300s
+    depends_on:
+      video-detector:
+        condition: service_healthy
