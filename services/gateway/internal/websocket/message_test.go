@@ -10,6 +10,8 @@ import (
 func TestMessage_RoundTrip(t *testing.T) {
 	original := websocket.Message{
 		Type:    websocket.TypeOffer,
+		From:    "a",
+		To:      "b",
 		Payload: json.RawMessage(`{"sdp":"fake-sdp"}`),
 	}
 
@@ -26,13 +28,38 @@ func TestMessage_RoundTrip(t *testing.T) {
 	if decoded.Type != original.Type {
 		t.Errorf("Type = %q, want %q", decoded.Type, original.Type)
 	}
+	if decoded.From != original.From {
+		t.Errorf("From = %q, want %q", decoded.From, original.From)
+	}
+	if decoded.To != original.To {
+		t.Errorf("To = %q, want %q", decoded.To, original.To)
+	}
 	if string(decoded.Payload) != string(original.Payload) {
 		t.Errorf("Payload = %s, want %s", decoded.Payload, original.Payload)
 	}
 }
 
+func TestMessage_PeersRoundTrip(t *testing.T) {
+	original := websocket.Message{Type: websocket.TypePeers, Peers: []string{"a", "b"}}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	var decoded websocket.Message
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	if len(decoded.Peers) != 2 || decoded.Peers[0] != "a" || decoded.Peers[1] != "b" {
+		t.Errorf("Peers = %v, want [a b]", decoded.Peers)
+	}
+}
+
 func TestMessage_TypeValues(t *testing.T) {
 	cases := map[websocket.Type]string{
+		websocket.TypePeers:        "peers",
 		websocket.TypeJoin:         "join",
 		websocket.TypeOffer:        "offer",
 		websocket.TypeAnswer:       "answer",

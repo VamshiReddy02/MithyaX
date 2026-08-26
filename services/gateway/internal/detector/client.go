@@ -24,15 +24,15 @@ const (
 	KindTimeout
 	// KindUnavailable means the video-detector service could not be reached.
 	KindUnavailable
-	// KindInvalidVideo means the video-detector rejected the video itself
-	// (unreachable URL, corrupt file, unsupported format, ...).
+	// KindInvalidVideo means the video-detector rejected the input itself
+	// (unreachable URL, corrupt file/frame, unsupported format, ...).
 	KindInvalidVideo
 	// KindDetectorError means the video-detector reached the request but
 	// failed to process it (5xx or a malformed response).
 	KindDetectorError
 )
 
-// Error is returned by Client.Analyze when the call does not succeed.
+// Error is returned by Client methods when the call does not succeed.
 type Error struct {
 	Kind    Kind
 	Message string
@@ -42,7 +42,8 @@ func (e *Error) Error() string {
 	return e.Message
 }
 
-// Result is the analysis produced by the video-detector's Xception model.
+// Result is the analysis produced by the video-detector's Xception model
+// over a whole video.
 type Result struct {
 	Video           string  `json:"video"`
 	Frames          int     `json:"frames"`
@@ -54,6 +55,14 @@ type Result struct {
 	FakeP90         float64 `json:"fake_p90"`
 	FakeMax         float64 `json:"fake_max"`
 	EmbeddingFrames int     `json:"embedding_frames"`
+	Verdict         string  `json:"verdict"`
+}
+
+// FrameResult is the analysis produced by the video-detector's Xception
+// model over a single still frame.
+type FrameResult struct {
+	FaceDetected    bool    `json:"face_detected"`
+	FakeProbability float64 `json:"fake_probability"`
 	Verdict         string  `json:"verdict"`
 }
 
@@ -82,18 +91,48 @@ type errorBody struct {
 }
 
 // Analyze sends videoURL to the video-detector and returns its Xception
-// inference result.
+// inference result over the whole video.
 func (c *Client) Analyze(ctx context.Context, videoURL string) (*Result, error) {
 	body, err := json.Marshal(analyzeRequest{VideoURL: videoURL})
 	if err != nil {
 		return nil, &Error{Kind: KindUnknown, Message: err.Error()}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/analyze", bytes.NewReader(body))
+	respBody, err := c.post(ctx, "/analyze", "application/json", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result Result
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, &Error{Kind: KindDetectorError, Message: fmt.Sprintf("invalid video-detector response: %v", err)}
+	}
+	return &result, nil
+}
+
+// AnalyzeFrame sends a single JPEG frame to the video-detector and returns
+// its Xception inference result for that frame alone.
+func (c *Client) AnalyzeFrame(ctx context.Context, jpeg []byte) (*FrameResult, error) {
+	respBody, err := c.post(ctx, "/analyze-frame", "image/jpeg", jpeg)
+	if err != nil {
+		return nil, err
+	}
+
+	var result FrameResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, &Error{Kind: KindDetectorError, Message: fmt.Sprintf("invalid video-detector response: %v", err)}
+	}
+	return &result, nil
+}
+
+// post sends body to path on the video-detector and returns the raw
+// response bytes on success, classifying any failure into an *Error.
+func (c *Client) post(ctx context.Context, path, contentType string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, &Error{Kind: KindUnknown, Message: err.Error()}
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -111,11 +150,7 @@ func (c *Client) Analyze(ctx context.Context, videoURL string) (*Result, error) 
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		var result Result
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			return nil, &Error{Kind: KindDetectorError, Message: fmt.Sprintf("invalid video-detector response: %v", err)}
-		}
-		return &result, nil
+		return respBody, nil
 
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		return nil, &Error{Kind: KindInvalidVideo, Message: extractMessage(respBody, resp.StatusCode)}

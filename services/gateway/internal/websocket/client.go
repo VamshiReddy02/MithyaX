@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"crypto/rand"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -17,6 +19,7 @@ const (
 
 // Client represents one browser connected to the signaling endpoint.
 type Client struct {
+	id   string
 	hub  *Hub
 	conn *gorilla.Conn
 	room string
@@ -26,15 +29,37 @@ type Client struct {
 
 var _ peer = (*Client)(nil)
 
-// NewClient wraps an upgraded WebSocket connection for room.
-func NewClient(hub *Hub, conn *gorilla.Conn, room string, log *slog.Logger) *Client {
+// NewClient wraps an upgraded WebSocket connection for room, assigning it
+// a fresh peer ID.
+func NewClient(hub *Hub, conn *gorilla.Conn, room string, log *slog.Logger) (*Client, error) {
+	id, err := newPeerID()
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
+		id:   id,
 		hub:  hub,
 		conn: conn,
 		room: room,
 		send: make(chan Message, sendBuffer),
 		log:  log,
+	}, nil
+}
+
+// ID returns this client's peer ID, as sent to other peers in From/To
+// fields.
+func (c *Client) ID() string {
+	return c.id
+}
+
+func newPeerID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
 	}
+	buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+	buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
 }
 
 // Send queues msg for delivery to this client. It never blocks; if the
@@ -48,14 +73,16 @@ func (c *Client) Send(msg Message) {
 	}
 }
 
-// ReadPump reads signaling messages from the browser and relays them to
-// the other peer in the room. It blocks until the connection closes, then
-// removes the client from its room.
+// ReadPump reads signaling messages from the browser and routes them to
+// their addressed peer in the room. It blocks until the connection
+// closes, then removes the client from its room.
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Leave(c.room, c)
+		// Closing send lets WritePump write a graceful close frame and
+		// close the connection itself; closing conn here too would race
+		// it and could sever the connection before that frame goes out.
 		close(c.send)
-		c.conn.Close()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -73,7 +100,16 @@ func (c *Client) ReadPump() {
 		if msg.Type == TypeLeave {
 			return
 		}
-		c.hub.Broadcast(c.room, c, msg)
+		if msg.To == "" {
+			c.log.Warn("dropping message with no target peer", slog.String("type", string(msg.Type)))
+			continue
+		}
+
+		msg.From = c.id
+		if err := c.hub.Route(c.room, msg); err != nil {
+			// Benign: the target likely just left mid-negotiation.
+			c.log.Warn("failed to route message", slog.String("to", msg.To), slog.String("error", err.Error()))
+		}
 	}
 }
 

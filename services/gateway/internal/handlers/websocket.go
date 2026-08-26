@@ -20,8 +20,8 @@ var upgrader = gorilla.Upgrader{
 
 // NewWebSocket builds the /api/v1/ws signaling handler backed by hub. It
 // upgrades the HTTP connection, joins the caller into the room named by
-// the "room" query parameter, and relays signaling messages to the other
-// peer in that room.
+// the "room" query parameter, tells it who's already there, and routes
+// its signaling messages to their addressed peers.
 func NewWebSocket(hub *websocket.Hub, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		room := c.Query("room")
@@ -36,14 +36,21 @@ func NewWebSocket(hub *websocket.Hub, logger *slog.Logger) gin.HandlerFunc {
 			return
 		}
 
-		client := websocket.NewClient(hub, conn, room, logger)
+		client, err := websocket.NewClient(hub, conn, room, logger)
+		if err != nil {
+			logger.Error("failed to create websocket client", slog.String("error", err.Error()))
+			conn.Close()
+			return
+		}
 
-		if err := hub.Join(room, client); err != nil {
+		existingPeers, err := hub.Join(room, client)
+		if err != nil {
 			client.Close(gorilla.ClosePolicyViolation, err.Error())
 			return
 		}
 
 		go client.WritePump()
+		client.Send(websocket.Message{Type: websocket.TypePeers, Peers: existingPeers})
 		client.ReadPump()
 	}
 }

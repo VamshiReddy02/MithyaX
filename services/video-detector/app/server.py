@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
+import cv2
 import httpx
-from fastapi import FastAPI, HTTPException
+import numpy as np
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, HttpUrl
 
-from app.diagnostic import analyze_video
+from app.diagnostic import analyze_video, extract_face
 from app.embedding import FaceEmbeddingModel
 from app.face import FaceDetector
 from app.model import DeepfakeDetector
@@ -56,6 +58,12 @@ class AnalyzeResponse(BaseModel):
     verdict: str
 
 
+class FrameAnalysisResponse(BaseModel):
+    face_detected: bool
+    fake_probability: float
+    verdict: str
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -95,6 +103,38 @@ def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
         embedding_frames=report["embedding_frames"],
         verdict="fake" if fake_score >= FAKE_THRESHOLD else "real",
     )
+
+
+@app.post("/analyze-frame", response_model=FrameAnalysisResponse)
+async def analyze_frame(request: Request) -> FrameAnalysisResponse:
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty request body")
+
+    frame = _decode_image(body)
+
+    face = extract_face(frame, models.face_detector)
+    if face is None:
+        return FrameAnalysisResponse(face_detected=False, fake_probability=0.0, verdict="unknown")
+
+    prediction = models.detector.predict_face(face)
+    fake_probability = float(prediction["fake_probability"])
+
+    return FrameAnalysisResponse(
+        face_detected=True,
+        fake_probability=fake_probability,
+        verdict="fake" if fake_probability >= FAKE_THRESHOLD else "real",
+    )
+
+
+def _decode_image(data: bytes) -> np.ndarray:
+    array = np.frombuffer(data, dtype=np.uint8)
+    frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        raise HTTPException(status_code=400, detail="could not decode image")
+
+    return frame
 
 
 def _download_video(url: str, destination: Path) -> None:

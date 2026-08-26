@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -116,6 +117,74 @@ func TestAnalyze_Timeout(t *testing.T) {
 	}
 	if derr.Kind != detector.KindTimeout {
 		t.Errorf("Kind = %v, want KindTimeout", derr.Kind)
+	}
+}
+
+func TestAnalyzeFrame_Success(t *testing.T) {
+	want := detector.FrameResult{FaceDetected: true, FakeProbability: 0.91, Verdict: "fake"}
+
+	var gotContentType, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/analyze-frame" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		gotContentType = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(want)
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	got, err := client.AnalyzeFrame(context.Background(), []byte("fake-jpeg-bytes"))
+	if err != nil {
+		t.Fatalf("AnalyzeFrame() error = %v", err)
+	}
+	if *got != want {
+		t.Errorf("AnalyzeFrame() = %+v, want %+v", *got, want)
+	}
+	if gotContentType != "image/jpeg" {
+		t.Errorf("Content-Type = %q, want %q", gotContentType, "image/jpeg")
+	}
+	if gotBody != "fake-jpeg-bytes" {
+		t.Errorf("request body = %q, want %q", gotBody, "fake-jpeg-bytes")
+	}
+}
+
+func TestAnalyzeFrame_NoFaceDetected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(detector.FrameResult{FaceDetected: false, FakeProbability: 0, Verdict: "unknown"})
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	got, err := client.AnalyzeFrame(context.Background(), []byte("fake-jpeg-bytes"))
+	if err != nil {
+		t.Fatalf("AnalyzeFrame() error = %v", err)
+	}
+	if got.FaceDetected {
+		t.Errorf("FaceDetected = true, want false")
+	}
+}
+
+func TestAnalyzeFrame_InvalidImage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"detail": "could not decode image"})
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	_, err := client.AnalyzeFrame(context.Background(), []byte("not-a-jpeg"))
+
+	var derr *detector.Error
+	if !errors.As(err, &derr) {
+		t.Fatalf("AnalyzeFrame() error = %v, want *detector.Error", err)
+	}
+	if derr.Kind != detector.KindInvalidVideo {
+		t.Errorf("Kind = %v, want KindInvalidVideo", derr.Kind)
 	}
 }
 

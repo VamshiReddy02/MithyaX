@@ -21,7 +21,7 @@ func New(cfg config.Config, logger *slog.Logger) *http.Server {
 	}
 
 	router := gin.New()
-	router.Use(middleware.Logging(logger), gin.Recovery())
+	router.Use(middleware.Logging(logger), middleware.CORS(), gin.Recovery())
 
 	detectorClient := detector.NewClient(cfg.DetectorBaseURL, cfg.DetectorTimeout)
 	signalingHub := websocket.NewHub()
@@ -30,6 +30,7 @@ func New(cfg config.Config, logger *slog.Logger) *http.Server {
 
 	v1 := router.Group("/api/v1")
 	v1.POST("/analyze", handlers.NewAnalyze(detectorClient))
+	v1.POST("/analyze-frame", handlers.NewAnalyzeFrame(detectorClient))
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
 
 	return &http.Server{
