@@ -5,8 +5,10 @@ following the same pattern: a FastAPI service the Go gateway calls into.
 
 ## Status
 
-Phase 4, Step 1 — skeleton only. `POST /analyze-audio` returns a mock
-response; no audio decoding or ML inference is wired up yet.
+Phase 4, Step 2 — WAV loading and decoding. `POST /analyze-audio` decodes
+the uploaded WAV file and returns its real metadata (duration, sample
+rate, channel count). No ML inference is wired up yet, and only WAV is
+supported — MP3/M4A/WebM are future scope.
 
 ## Run locally
 
@@ -37,6 +39,6 @@ app/
   config.py       static configuration
   schemas.py      request/response models
   audio/
-    loader.py         audio decoding (not implemented yet)
+    loader.py         WAV decoding -> waveform + metadata
     preprocessing.py  normalization/chunking (not implemented yet)
 ```

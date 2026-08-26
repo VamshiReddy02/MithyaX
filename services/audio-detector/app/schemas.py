@@ -6,6 +6,5 @@ from pydantic import BaseModel
 class AnalyzeAudioResponse(BaseModel):
     audio: str
     duration: float
-    chunks_analyzed: int
-    fake_score: float
-    verdict: str
+    sample_rate: int
+    channels: int
