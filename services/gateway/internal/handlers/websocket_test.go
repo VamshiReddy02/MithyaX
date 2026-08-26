@@ -187,8 +187,8 @@ func TestWebSocket_ExplicitLeaveNotifiesPeer(t *testing.T) {
 	readMessage(t, clientA) // peers
 
 	clientB := dialRoom(t, wsURL, "room-2")
-	readMessage(t, clientB)         // peers
-	readMessage(t, clientA)         // join
+	readMessage(t, clientB) // peers
+	readMessage(t, clientA) // join
 
 	if err := clientB.WriteJSON(websocket.Message{Type: websocket.TypeLeave}); err != nil {
 		t.Fatalf("clientB WriteJSON(leave): %v", err)

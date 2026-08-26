@@ -8,6 +8,7 @@ const videosContainer = document.getElementById("videos");
 const statusEl = document.getElementById("status");
 const gatewayUrlInput = document.getElementById("gatewayUrl");
 const roomInput = document.getElementById("room");
+const cameraSelect = document.getElementById("cameraSelect");
 const joinButton = document.getElementById("joinButton");
 const hangupButton = document.getElementById("hangupButton");
 
@@ -39,6 +40,39 @@ function send(message) {
 function shortId(id) {
   return id ? id.slice(0, 8) : "unknown";
 }
+
+// Device labels are only populated once permission has been granted at
+// least once on this origin — before that they show up blank. We call
+// this on load (best effort) and again right after the first
+// getUserMedia() call, plus on devicechange so a camera that starts up
+// later (e.g. a virtual camera app launched after the page loaded) shows
+// up without a reload.
+async function refreshCameraList() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cameras = devices.filter((d) => d.kind === "videoinput");
+
+  const previouslySelected = cameraSelect.value;
+  cameraSelect.innerHTML = "";
+
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = "Default camera";
+  cameraSelect.appendChild(defaultOption);
+
+  cameras.forEach((device, index) => {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = device.label || `Camera ${index + 1}`;
+    cameraSelect.appendChild(option);
+  });
+
+  if (cameras.some((d) => d.deviceId === previouslySelected)) {
+    cameraSelect.value = previouslySelected;
+  }
+}
+
+navigator.mediaDevices.addEventListener("devicechange", refreshCameraList);
+refreshCameraList().catch(() => {});
 
 function createVideoTile(peerId) {
   const box = document.createElement("div");
@@ -260,8 +294,14 @@ async function join() {
 
   joinButton.disabled = true;
 
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  const selectedCamera = cameraSelect.value;
+  const videoConstraints = selectedCamera ? { deviceId: { exact: selectedCamera } } : true;
+  localStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: true });
   localVideo.srcObject = localStream;
+
+  // Now that permission is granted, device labels are populated — refresh
+  // so the dropdown shows real names instead of "Camera 1", "Camera 2".
+  refreshCameraList().catch(() => {});
 
   const url = `${gatewayUrlInput.value}?room=${encodeURIComponent(room)}`;
   ws = new WebSocket(url);

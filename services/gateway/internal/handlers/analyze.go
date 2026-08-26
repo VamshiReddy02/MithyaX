@@ -1,20 +1,17 @@
 package handlers
 
 import (
-	"context"
-	"crypto/rand"
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	"github.com/vamshireddy02/mithyax/gateway/internal/worker"
 )
 
-// DetectorClient analyzes a video and returns the video-detector's result.
-type DetectorClient interface {
-	Analyze(ctx context.Context, videoURL string) (*detector.Result, error)
+// JobSubmitter enqueues a video analysis job. worker.Pool implements it.
+type JobSubmitter interface {
+	Submit(videoURL string) (worker.Job, error)
 }
 
 // AnalyzeRequest is the JSON body accepted by the analyze endpoint.
@@ -22,15 +19,18 @@ type AnalyzeRequest struct {
 	VideoURL string `json:"video_url" binding:"required,url"`
 }
 
-// AnalyzeResponse is the JSON body returned once analysis has completed.
+// AnalyzeResponse is the JSON body returned once a job has been queued.
+// Poll GET /api/v1/analyze/:id for its result.
 type AnalyzeResponse struct {
-	ID       string          `json:"id"`
-	VideoURL string          `json:"video_url"`
-	Result   detector.Result `json:"result"`
+	ID       string `json:"id"`
+	VideoURL string `json:"video_url"`
+	Status   string `json:"status"`
 }
 
-// NewAnalyze builds the analyze handler backed by the given video-detector client.
-func NewAnalyze(client DetectorClient) gin.HandlerFunc {
+// NewAnalyze builds the analyze handler backed by the given job
+// submitter. It enqueues the request and returns immediately — it never
+// waits for the video-detector itself.
+func NewAnalyze(submitter JobSubmitter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req AnalyzeRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -38,51 +38,30 @@ func NewAnalyze(client DetectorClient) gin.HandlerFunc {
 			return
 		}
 
-		id, err := newRequestID()
+		job, err := submitter.Submit(req.VideoURL)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request id"})
+			status, message := submitErrorResponse(err)
+			c.JSON(status, gin.H{"id": job.ID, "error": message})
 			return
 		}
 
-		result, err := client.Analyze(c.Request.Context(), req.VideoURL)
-		if err != nil {
-			status, message := detectorErrorResponse(err)
-			c.JSON(status, gin.H{"id": id, "error": message})
-			return
-		}
-
-		c.JSON(http.StatusOK, AnalyzeResponse{
-			ID:       id,
-			VideoURL: req.VideoURL,
-			Result:   *result,
+		c.JSON(http.StatusAccepted, AnalyzeResponse{
+			ID:       job.ID,
+			VideoURL: job.VideoURL,
+			Status:   string(job.Status),
 		})
 	}
 }
 
-func detectorErrorResponse(err error) (int, string) {
-	var derr *detector.Error
-	if errors.As(err, &derr) {
-		switch derr.Kind {
-		case detector.KindInvalidVideo:
-			return http.StatusUnprocessableEntity, derr.Message
-		case detector.KindTimeout:
-			return http.StatusGatewayTimeout, "video-detector timed out"
-		case detector.KindUnavailable:
-			return http.StatusBadGateway, "video-detector is unavailable"
-		}
+func submitErrorResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, worker.ErrQueueFull):
+		return http.StatusServiceUnavailable, "job queue is full, try again shortly"
+	case errors.Is(err, worker.ErrPoolClosed):
+		return http.StatusServiceUnavailable, "server is shutting down"
+	case errors.Is(err, worker.ErrRedisUnavailable):
+		return http.StatusServiceUnavailable, "job queue is temporarily unavailable"
+	default:
+		return http.StatusInternalServerError, "failed to create job"
 	}
-	return http.StatusBadGateway, "video-detector failed to analyze video"
-}
-
-// newRequestID generates a random UUID v4 string.
-func newRequestID() (string, error) {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-
-	buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
-	buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
-
-	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
 }

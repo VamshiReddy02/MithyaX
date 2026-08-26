@@ -29,6 +29,15 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DetectorTimeout != defaultDetectorTimeout {
 		t.Errorf("DetectorTimeout = %v, want %v", cfg.DetectorTimeout, defaultDetectorTimeout)
 	}
+	if cfg.WorkerCount != defaultWorkerCount {
+		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, defaultWorkerCount)
+	}
+	if cfg.WorkerQueueSize != defaultWorkerQueueSize {
+		t.Errorf("WorkerQueueSize = %d, want %d", cfg.WorkerQueueSize, defaultWorkerQueueSize)
+	}
+	if cfg.WorkerShutdownTimeout != defaultWorkerShutdownTimeout {
+		t.Errorf("WorkerShutdownTimeout = %v, want %v", cfg.WorkerShutdownTimeout, defaultWorkerShutdownTimeout)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -38,6 +47,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_SHUTDOWN_TIMEOUT", "5s")
 	t.Setenv("GATEWAY_DETECTOR_URL", "http://detector:9000")
 	t.Setenv("GATEWAY_DETECTOR_TIMEOUT", "30s")
+	t.Setenv("GATEWAY_WORKER_COUNT", "8")
+	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "256")
+	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "3m")
 
 	cfg, err := Load()
 	if err != nil {
@@ -61,6 +73,15 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.DetectorTimeout != 30*time.Second {
 		t.Errorf("DetectorTimeout = %v, want %v", cfg.DetectorTimeout, 30*time.Second)
+	}
+	if cfg.WorkerCount != 8 {
+		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, 8)
+	}
+	if cfg.WorkerQueueSize != 256 {
+		t.Errorf("WorkerQueueSize = %d, want %d", cfg.WorkerQueueSize, 256)
+	}
+	if cfg.WorkerShutdownTimeout != 3*time.Minute {
+		t.Errorf("WorkerShutdownTimeout = %v, want %v", cfg.WorkerShutdownTimeout, 3*time.Minute)
 	}
 }
 
@@ -93,6 +114,30 @@ func TestLoad_InvalidDetectorTimeout(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with invalid GATEWAY_DETECTOR_TIMEOUT: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidWorkerShutdownTimeout(t *testing.T) {
+	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "not-a-duration")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_WORKER_SHUTDOWN_TIMEOUT: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidWorkerCount(t *testing.T) {
+	t.Setenv("GATEWAY_WORKER_COUNT", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_WORKER_COUNT=0: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidWorkerQueueSize(t *testing.T) {
+	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "not-a-number")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_WORKER_QUEUE_SIZE: expected error, got nil")
 	}
 }
 

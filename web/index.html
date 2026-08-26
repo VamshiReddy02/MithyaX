@@ -22,7 +22,7 @@
     margin-bottom: 16px;
     flex-wrap: wrap;
   }
-  input {
+  input, select {
     background: #1c1c1c;
     color: #eee;
     border: 1px solid #333;
@@ -94,6 +94,7 @@
   <div id="controls">
     <input id="gatewayUrl" size="30" value="ws://localhost:8080/api/v1/ws" />
     <input id="room" size="16" placeholder="room id" />
+    <select id="cameraSelect"><option value="">Default camera</option></select>
     <button id="joinButton">Join Call</button>
     <button id="hangupButton" class="hangup" disabled>Hang Up</button>
   </div>

@@ -42,7 +42,7 @@ func run() error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.HTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return
 		}
@@ -59,11 +59,29 @@ func run() error {
 		slog.Duration("timeout", cfg.ShutdownTimeout),
 	)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	httpShutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := srv.HTTP.Shutdown(httpShutdownCtx); err != nil {
 		return err
+	}
+
+	// Stop accepting new analyze jobs and let queued/in-flight ones
+	// finish. This gets its own, longer budget: a video analysis can
+	// take far longer than draining HTTP connections should.
+	logger.Info("waiting for in-flight analyze jobs to finish",
+		slog.Duration("timeout", cfg.WorkerShutdownTimeout),
+	)
+
+	workerShutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.WorkerShutdownTimeout)
+	defer cancel()
+
+	if err := srv.Pool.Shutdown(workerShutdownCtx); err != nil {
+		return err
+	}
+
+	if err := srv.Redis.Close(); err != nil {
+		logger.Warn("failed to close redis client cleanly", slog.String("error", err.Error()))
 	}
 
 	logger.Info("gateway stopped")

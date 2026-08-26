@@ -17,33 +17,58 @@ type Config struct {
 	Environment string
 	// LogLevel controls the minimum severity of emitted log records ("debug", "info", "warn", "error").
 	LogLevel string
-	// ShutdownTimeout bounds how long graceful shutdown waits for in-flight requests to finish.
+	// ShutdownTimeout bounds how long graceful shutdown waits for in-flight HTTP requests to finish.
 	ShutdownTimeout time.Duration
+	// WorkerShutdownTimeout bounds how long graceful shutdown waits for
+	// queued/in-flight analyze jobs to finish. Separate from
+	// ShutdownTimeout because a video analysis can legitimately take far
+	// longer than draining HTTP connections should.
+	WorkerShutdownTimeout time.Duration
 	// DetectorBaseURL is the base URL of the Python video-detector service.
 	DetectorBaseURL string
 	// DetectorTimeout bounds how long a single analysis request may take.
 	DetectorTimeout time.Duration
+	// WorkerCount is how many goroutines process analyze jobs concurrently.
+	WorkerCount int
+	// WorkerQueueSize bounds how many analyze jobs may be queued at once.
+	WorkerQueueSize int
+	// RedisAddr is the address (host:port) of the Redis instance backing
+	// job state and the job queue.
+	RedisAddr string
+	// JobTTL bounds how long a job's state is kept in Redis after its
+	// last update, before being automatically cleaned up.
+	JobTTL time.Duration
 }
 
 const (
-	defaultPort            = "8080"
-	defaultEnvironment     = "development"
-	defaultLogLevel        = "info"
-	defaultShutdownTimeout = 10 * time.Second
-	defaultDetectorBaseURL = "http://localhost:8000"
-	defaultDetectorTimeout = 60 * time.Second
+	defaultPort                  = "8080"
+	defaultEnvironment           = "development"
+	defaultLogLevel              = "info"
+	defaultShutdownTimeout       = 10 * time.Second
+	defaultWorkerShutdownTimeout = 2 * time.Minute
+	defaultDetectorBaseURL       = "http://localhost:8000"
+	defaultDetectorTimeout       = 60 * time.Second
+	defaultWorkerCount           = 4
+	defaultWorkerQueueSize       = 64
+	defaultRedisAddr             = "localhost:6379"
+	defaultJobTTL                = 24 * time.Hour
 )
 
 // Load builds a Config from environment variables, falling back to defaults
 // for anything unset.
 func Load() (Config, error) {
 	cfg := Config{
-		Port:            getEnv("GATEWAY_PORT", defaultPort),
-		Environment:     getEnv("GATEWAY_ENV", defaultEnvironment),
-		LogLevel:        getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
-		ShutdownTimeout: defaultShutdownTimeout,
-		DetectorBaseURL: getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
-		DetectorTimeout: defaultDetectorTimeout,
+		Port:                  getEnv("GATEWAY_PORT", defaultPort),
+		Environment:           getEnv("GATEWAY_ENV", defaultEnvironment),
+		LogLevel:              getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
+		ShutdownTimeout:       defaultShutdownTimeout,
+		WorkerShutdownTimeout: defaultWorkerShutdownTimeout,
+		DetectorBaseURL:       getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
+		DetectorTimeout:       defaultDetectorTimeout,
+		WorkerCount:           defaultWorkerCount,
+		WorkerQueueSize:       defaultWorkerQueueSize,
+		RedisAddr:             getEnv("GATEWAY_REDIS_ADDR", defaultRedisAddr),
+		JobTTL:                defaultJobTTL,
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -60,6 +85,38 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid GATEWAY_DETECTOR_TIMEOUT %q: %w", raw, err)
 		}
 		cfg.DetectorTimeout = d
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT"); ok {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid GATEWAY_WORKER_SHUTDOWN_TIMEOUT %q: %w", raw, err)
+		}
+		cfg.WorkerShutdownTimeout = d
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_WORKER_COUNT"); ok {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("invalid GATEWAY_WORKER_COUNT %q: must be a positive integer", raw)
+		}
+		cfg.WorkerCount = n
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_WORKER_QUEUE_SIZE"); ok {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("invalid GATEWAY_WORKER_QUEUE_SIZE %q: must be a positive integer", raw)
+		}
+		cfg.WorkerQueueSize = n
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_JOB_TTL"); ok {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid GATEWAY_JOB_TTL %q: %w", raw, err)
+		}
+		cfg.JobTTL = d
 	}
 
 	if _, err := strconv.Atoi(cfg.Port); err != nil {

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 
@@ -48,4 +49,19 @@ func NewAnalyzeFrame(client FrameDetectorClient) gin.HandlerFunc {
 
 		c.JSON(http.StatusOK, result)
 	}
+}
+
+func detectorErrorResponse(err error) (int, string) {
+	var derr *detector.Error
+	if errors.As(err, &derr) {
+		switch derr.Kind {
+		case detector.KindInvalidVideo:
+			return http.StatusUnprocessableEntity, derr.Message
+		case detector.KindTimeout:
+			return http.StatusGatewayTimeout, "video-detector timed out"
+		case detector.KindUnavailable:
+			return http.StatusBadGateway, "video-detector is unavailable"
+		}
+	}
+	return http.StatusBadGateway, "video-detector failed to analyze video"
 }
