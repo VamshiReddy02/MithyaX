@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "MithyaX for Google Meet",
+  "version": "0.1.0",
+  "description": "Streams the remote participant's video/audio from a Google Meet call to MithyaX for real-time deepfake risk analysis.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["capture.js", "ui.js", "content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "http://localhost:8080/*"
+  ]
+}
