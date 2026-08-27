@@ -1,7 +1,11 @@
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 const FRAME_SAMPLE_INTERVAL_MS = 1000;
-const VERDICT_HISTORY_SIZE = 5;
 const FRAME_JPEG_QUALITY = 0.8;
+// The audio-detector currently only decodes WAV (see
+// services/audio-detector/app/audio/decoder.py) — raw PCM is captured
+// via the Web Audio API and encoded to WAV by hand rather than using
+// MediaRecorder's webm/opus output.
+const AUDIO_CHUNK_SECONDS = 3;
 
 const localVideo = document.getElementById("localVideo");
 const videosContainer = document.getElementById("videos");
@@ -86,16 +90,21 @@ function createVideoTile(peerId) {
   badge.className = "badge badge-pending";
   badge.textContent = "checking...";
 
+  const scoreLine = document.createElement("span");
+  scoreLine.className = "score-line";
+  scoreLine.textContent = "";
+
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
 
   box.appendChild(label);
   box.appendChild(badge);
+  box.appendChild(scoreLine);
   box.appendChild(video);
   videosContainer.appendChild(box);
 
-  return { videoEl: video, badgeEl: badge };
+  return { videoEl: video, badgeEl: badge, scoreEl: scoreLine };
 }
 
 function removeVideoTile(peerId) {
@@ -120,41 +129,117 @@ function captureFrame(videoEl) {
   });
 }
 
-// Derives the gateway's plain HTTP origin from its WebSocket URL, e.g.
-// "ws://localhost:8080/api/v1/ws" -> "http://localhost:8080".
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// --- WAV encoding: the audio-detector decodes WAV only (see decoder.py) ---
+function writeAsciiString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+}
+
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  writeAsciiString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeAsciiString(view, 8, "WAVE");
+  writeAsciiString(view, 12, "fmt ");
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate (16-bit mono)
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeAsciiString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+
+  return new Blob([view], { type: "audio/wav" });
+}
+
+function mergeFloat32(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+// Derives the gateway's plain HTTP/WS origins from the signaling URL
+// entered in the UI, e.g. "ws://localhost:8080/api/v1/ws" ->
+// "http://localhost:8080" / "ws://localhost:8080".
 function gatewayHttpOrigin() {
   const wsUrl = new URL(gatewayUrlInput.value);
   const httpProtocol = wsUrl.protocol === "wss:" ? "https:" : "http:";
   return `${httpProtocol}//${wsUrl.host}`;
 }
 
-function updateBadge(badgeEl, history) {
-  if (history.length === 0) {
-    badgeEl.textContent = "checking...";
-    badgeEl.className = "badge badge-pending";
-    return;
-  }
-
-  const fakeVotes = history.filter((verdict) => verdict === "fake").length;
-  const isFake = fakeVotes > history.length / 2;
-
-  badgeEl.textContent = isFake ? "🔴 AI" : "🟢 REAL";
-  badgeEl.className = "badge " + (isFake ? "badge-fake" : "badge-real");
+function gatewayWsOrigin() {
+  const wsUrl = new URL(gatewayUrlInput.value);
+  return `${wsUrl.protocol}//${wsUrl.host}`;
 }
 
-// PeerCall wraps one direct connection to one other participant.
+const VERDICT_BADGES = {
+  LIKELY_AUTHENTIC: ["badge-real", "🟢 REAL"],
+  SUSPICIOUS: ["badge-suspicious", "🟡 SUSPICIOUS"],
+  LIKELY_FAKE: ["badge-fake", "🔴 AI"],
+  UNKNOWN: ["badge-pending", "checking..."],
+};
+
+function renderRiskUpdate(badgeEl, scoreEl, message) {
+  const [className, label] = VERDICT_BADGES[message.verdict] || VERDICT_BADGES.UNKNOWN;
+  badgeEl.className = "badge " + className;
+  badgeEl.textContent = label;
+  scoreEl.textContent = `risk ${message.risk_score.toFixed(2)}`;
+  scoreEl.title = (message.reasons || []).join("\n");
+}
+
+// PeerCall wraps one direct connection to one other participant. Once
+// their remote stream arrives, it opens a MithyaX live analysis session
+// (POST /api/v1/sessions + WebSocket /api/v1/sessions/ws) and streams
+// that peer's own remote video frames and audio into it — this is the
+// "remote video/audio → MithyaX" path from the real-time architecture,
+// as opposed to web/live-session.js's demo of analyzing your own local
+// camera.
 class PeerCall {
   constructor(peerId) {
     this.peerId = peerId;
     this.remoteDescriptionSet = false;
     this.pendingCandidates = [];
-    this.verdictHistory = [];
-    this.sampleTimer = null;
+
+    this.analysisStarted = false;
+    this.sessionWs = null;
+    this.frameTimer = null;
     this.sampling = false;
+
+    this.audioContext = null;
+    this.audioSourceNode = null;
+    this.audioProcessorNode = null;
+    this.audioSilentGain = null;
+    this.pendingAudioChunks = [];
 
     const tile = createVideoTile(peerId);
     this.videoEl = tile.videoEl;
     this.badgeEl = tile.badgeEl;
+    this.scoreEl = tile.scoreEl;
 
     this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
@@ -164,7 +249,14 @@ class PeerCall {
 
     this.pc.ontrack = (event) => {
       this.videoEl.srcObject = event.streams[0];
-      this.startSampling();
+      // ontrack fires once per track (video and audio separately, even
+      // though both belong to the same remote stream) — guard so the
+      // session is only created and its capture pipelines only started
+      // once per peer, not once per track.
+      if (!this.analysisStarted) {
+        this.analysisStarted = true;
+        this.startAnalysisSession(event.streams[0]);
+      }
     };
 
     this.pc.onicecandidate = (event) => {
@@ -178,57 +270,149 @@ class PeerCall {
     };
   }
 
-  startSampling() {
-    if (this.sampleTimer) {
+  // Creates a MithyaX live session for this peer's remote stream and
+  // starts streaming frames/audio into it once the WebSocket is open.
+  async startAnalysisSession(remoteStream) {
+    try {
+      const response = await fetch(`${gatewayHttpOrigin()}/api/v1/sessions`, { method: "POST" });
+      if (!response.ok) {
+        throw new Error(`failed to create session: HTTP ${response.status}`);
+      }
+      const { id: sessionId } = await response.json();
+      log(`analysis session ${shortId(sessionId)} created for peer ${shortId(this.peerId)}`);
+
+      const wsUrl = `${gatewayWsOrigin()}/api/v1/sessions/ws?session_id=${encodeURIComponent(sessionId)}`;
+      this.sessionWs = new WebSocket(wsUrl);
+
+      this.sessionWs.onopen = () => {
+        this.startFrameSampling();
+        if (remoteStream.getAudioTracks().length > 0) {
+          this.startAudioCapture(remoteStream);
+        }
+      };
+      this.sessionWs.onmessage = (event) => this.handleSessionMessage(JSON.parse(event.data));
+      this.sessionWs.onerror = () => log(`analysis session error for peer ${shortId(this.peerId)}`);
+      this.sessionWs.onclose = () => log(`analysis session closed for peer ${shortId(this.peerId)}`);
+    } catch (err) {
+      log(`failed to start analysis session for ${shortId(this.peerId)}: ${err.message}`);
+    }
+  }
+
+  sendSessionMessage(message) {
+    if (this.sessionWs && this.sessionWs.readyState === WebSocket.OPEN) {
+      this.sessionWs.send(JSON.stringify(message));
+    }
+  }
+
+  handleSessionMessage(message) {
+    switch (message.type) {
+      case "risk_update":
+        renderRiskUpdate(this.badgeEl, this.scoreEl, message);
+        break;
+      case "error":
+        log(`analysis error for peer ${shortId(this.peerId)}: ${message.message}`);
+        break;
+      // video_result / audio_result / temporal_result / session_started /
+      // session_ended carry no UI of their own here — risk_update, sent
+      // after each of them, is what drives the badge.
+    }
+  }
+
+  startFrameSampling() {
+    if (this.frameTimer) {
       return;
     }
-    this.sampleTimer = setInterval(() => this.sampleFrame(), FRAME_SAMPLE_INTERVAL_MS);
+    this.frameTimer = setInterval(() => this.sampleFrame(), FRAME_SAMPLE_INTERVAL_MS);
   }
 
-  stopSampling() {
-    clearInterval(this.sampleTimer);
-    this.sampleTimer = null;
+  stopFrameSampling() {
+    clearInterval(this.frameTimer);
+    this.frameTimer = null;
   }
 
-  // Grabs the current frame from this peer's video, sends it off for a
-  // real/fake check, and folds the result into a rolling majority vote —
-  // a single noisy frame shouldn't flip the badge on its own.
+  // Grabs the current frame from this peer's video and streams it into
+  // the analysis session.
   async sampleFrame() {
     if (this.sampling) {
-      return; // previous request still in flight; skip this tick
+      return; // previous frame still uploading; skip this tick
     }
-
     this.sampling = true;
     try {
       const blob = await captureFrame(this.videoEl);
       if (!blob) {
         return;
       }
-
-      const response = await fetch(`${gatewayHttpOrigin()}/api/v1/analyze-frame`, {
-        method: "POST",
-        headers: { "Content-Type": "image/jpeg" },
-        body: blob,
-      });
-      if (!response.ok) {
-        return;
-      }
-
-      const result = await response.json();
-      if (!result.face_detected) {
-        return; // don't let "no face visible" count as evidence either way
-      }
-
-      this.verdictHistory.push(result.verdict);
-      if (this.verdictHistory.length > VERDICT_HISTORY_SIZE) {
-        this.verdictHistory.shift();
-      }
-      updateBadge(this.badgeEl, this.verdictHistory);
+      const data = await blobToBase64(blob);
+      this.sendSessionMessage({ type: "frame", data });
     } catch (err) {
-      // Transient network hiccup — just skip this tick.
+      // Transient hiccup — just skip this tick.
     } finally {
       this.sampling = false;
     }
+  }
+
+  startAudioCapture(stream) {
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    this.audioSourceNode = this.audioContext.createMediaStreamSource(stream);
+
+    // ScriptProcessorNode is deprecated in favor of AudioWorklet, but
+    // needs no separate module file to load — simplest thing that works
+    // reliably across browsers for this reference client.
+    this.audioProcessorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+    this.pendingAudioChunks = [];
+
+    this.audioProcessorNode.onaudioprocess = (event) => {
+      this.pendingAudioChunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+
+      const totalSamples = this.pendingAudioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      if (totalSamples >= this.audioContext.sampleRate * AUDIO_CHUNK_SECONDS) {
+        this.flushAudioChunk();
+      }
+    };
+
+    // Some browsers only fire onaudioprocess while the node is connected
+    // all the way to a destination. Routing through a zero-gain node
+    // avoids playing the peer's own audio back out a second time (their
+    // <video> element already plays it).
+    this.audioSilentGain = this.audioContext.createGain();
+    this.audioSilentGain.gain.value = 0;
+
+    this.audioSourceNode.connect(this.audioProcessorNode);
+    this.audioProcessorNode.connect(this.audioSilentGain);
+    this.audioSilentGain.connect(this.audioContext.destination);
+  }
+
+  async flushAudioChunk() {
+    if (this.pendingAudioChunks.length === 0) {
+      return;
+    }
+    const samples = mergeFloat32(this.pendingAudioChunks);
+    this.pendingAudioChunks = [];
+
+    const wavBlob = encodeWav(samples, this.audioContext.sampleRate);
+    const data = await blobToBase64(wavBlob);
+    this.sendSessionMessage({ type: "audio_chunk", data, filename: "chunk.wav" });
+  }
+
+  stopAudioCapture() {
+    if (this.audioProcessorNode) {
+      this.audioProcessorNode.disconnect();
+      this.audioProcessorNode.onaudioprocess = null;
+      this.audioProcessorNode = null;
+    }
+    if (this.audioSourceNode) {
+      this.audioSourceNode.disconnect();
+      this.audioSourceNode = null;
+    }
+    if (this.audioSilentGain) {
+      this.audioSilentGain.disconnect();
+      this.audioSilentGain = null;
+    }
+    if (this.audioContext) {
+      this.audioContext.close();
+      this.audioContext = null;
+    }
+    this.pendingAudioChunks = [];
   }
 
   async createOffer() {
@@ -270,7 +454,15 @@ class PeerCall {
   }
 
   close() {
-    this.stopSampling();
+    this.stopFrameSampling();
+    this.stopAudioCapture();
+
+    if (this.sessionWs) {
+      this.sendSessionMessage({ type: "end_session" });
+      this.sessionWs.close();
+      this.sessionWs = null;
+    }
+
     this.pc.close();
     removeVideoTile(this.peerId);
   }

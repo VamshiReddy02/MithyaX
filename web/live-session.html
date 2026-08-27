@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MithyaX Live Session</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 600;
+  }
+  #controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  input {
+    background: #1c1c1c;
+    color: #eee;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 6px 8px;
+  }
+  button {
+    background: #2d6cdf;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: #444;
+    cursor: not-allowed;
+  }
+  button.stop {
+    background: #c0392b;
+  }
+  #main {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  video {
+    width: 360px;
+    height: 270px;
+    background: #000;
+    border-radius: 6px;
+  }
+  #panel {
+    min-width: 280px;
+  }
+  .verdict {
+    font-size: 28px;
+    font-weight: 700;
+    padding: 10px 16px;
+    border-radius: 8px;
+    width: fit-content;
+    margin-bottom: 12px;
+  }
+  .verdict-unknown { background: #2a2a2a; color: #999; }
+  .verdict-authentic { background: #14331a; color: #4caf50; }
+  .verdict-suspicious { background: #3a2f14; color: #e0a853; }
+  .verdict-fake { background: #3a1414; color: #e05353; }
+  .signal-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    padding: 4px 0;
+    border-bottom: 1px solid #222;
+  }
+  .signal-label { color: #999; }
+  #reasons {
+    margin-top: 12px;
+    font-size: 12px;
+    color: #e0a853;
+    list-style: none;
+    padding: 0;
+  }
+  #reasons li {
+    padding: 3px 0;
+  }
+  #status {
+    margin-top: 16px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: #9a9;
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+</style>
+</head>
+<body>
+  <h1>MithyaX Live Session</h1>
+  <p style="color:#999; font-size:13px; max-width:640px;">
+    Phase 4 reference client: creates a live analysis session
+    (<code>POST /api/v1/sessions</code>), streams your own camera frames and
+    microphone audio over <code>/api/v1/sessions/ws</code>, and renders the
+    live video / audio / temporal / risk updates as they arrive.
+  </p>
+
+  <div id="controls">
+    <input id="gatewayUrl" size="30" value="http://localhost:8080" />
+    <button id="startButton">Start Session</button>
+    <button id="stopButton" class="stop" disabled>End Session</button>
+  </div>
+
+  <div id="main">
+    <video id="localVideo" autoplay playsinline muted></video>
+
+    <div id="panel">
+      <div id="verdictBadge" class="verdict verdict-unknown">UNKNOWN</div>
+
+      <div class="signal-row"><span class="signal-label">Video fake score</span><span id="videoScore">—</span></div>
+      <div class="signal-row"><span class="signal-label">Audio fake score</span><span id="audioScore">—</span></div>
+      <div class="signal-row"><span class="signal-label">Temporal score</span><span id="temporalScore">—</span></div>
+      <div class="signal-row"><span class="signal-label">Risk score</span><span id="riskScore">—</span></div>
+
+      <ul id="reasons"></ul>
+    </div>
+  </div>
+
+  <pre id="status"></pre>
+
+  <script src="live-session.js"></script>
+</body>
+</html>

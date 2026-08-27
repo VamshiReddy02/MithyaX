@@ -14,8 +14,10 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/middleware"
+	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
+	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
 	"github.com/vamshireddy02/mithyax/gateway/internal/websocket"
 	"github.com/vamshireddy02/mithyax/gateway/internal/worker"
 )
@@ -52,8 +54,17 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
 	pool.Start(cfg.WorkerCount)
 
-	sessionService := session.NewService(detectorClient, audioClient, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
+	temporalAnalyzer := temporal.NewAnalyzer()
+	sessionService := session.NewService(detectorClient, audioClient, temporalAnalyzer, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
 	riskEngine := risk.NewEngine()
+	realtimeCfg := realtime.Config{
+		MaxVideoQueue: cfg.RealtimeMaxVideoQueue,
+		VideoWorkers:  cfg.RealtimeVideoWorkers,
+		MaxAudioQueue: cfg.RealtimeMaxAudioQueue,
+		AudioWorkers:  cfg.RealtimeAudioWorkers,
+		MaxSessions:   cfg.RealtimeMaxSessions,
+	}
+	liveSessionStore := realtime.NewStore(detectorClient, audioClient, temporalAnalyzer, riskEngine, realtimeCfg)
 
 	router.GET("/health", handlers.Health)
 
@@ -64,6 +75,9 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 	v1.POST("/analyze-audio", handlers.NewAnalyzeAudio(audioClient))
 	v1.POST("/analyze-session", handlers.NewAnalyzeSession(sessionService, riskEngine))
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
+	v1.POST("/sessions", handlers.NewCreateSession(liveSessionStore))
+	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, logger))
+	v1.GET("/sessions/metrics", handlers.NewSessionMetrics(liveSessionStore))
 
 	return &Server{
 		HTTP: &http.Server{

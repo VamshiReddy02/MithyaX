@@ -56,6 +56,66 @@ type Result struct {
 	FakeMax         float64 `json:"fake_max"`
 	EmbeddingFrames int     `json:"embedding_frames"`
 	Verdict         string  `json:"verdict"`
+	// FrameMetadata is a downsampled, evenly-spaced subset of the
+	// frames the video-detector actually processed (see the Python
+	// service's sample_frame_metadata) — not every frame in the video.
+	FrameMetadata []FrameMetadata `json:"frame_metadata"`
+}
+
+// FrameMetadata is one analyzed frame's metadata, as returned by the
+// video-detector's /analyze endpoint. Its fields mirror
+// internal/temporal.Frame's flat shape one for one, even though the
+// wire format nests the face box under a "face" object (see
+// UnmarshalJSON) — that nesting is a JSON presentation detail, not
+// something callers of this package need to know about. FaceX/Y/Width/
+// Height are 0 when FaceDetected is false: there's no box to report.
+type FrameMetadata struct {
+	Timestamp    float64
+	FakeScore    float64
+	FaceDetected bool
+	FaceX        float64
+	FaceY        float64
+	FaceWidth    float64
+	FaceHeight   float64
+}
+
+// frameMetadataWire is FrameMetadata's actual wire shape: the video-
+// detector nests the bounding box under a "face" object (null when no
+// face was found) rather than flattening it.
+type frameMetadataWire struct {
+	Timestamp    float64 `json:"timestamp"`
+	FakeScore    float64 `json:"fake_score"`
+	FaceDetected bool    `json:"face_detected"`
+	Face         *struct {
+		X      float64 `json:"x"`
+		Y      float64 `json:"y"`
+		Width  float64 `json:"width"`
+		Height float64 `json:"height"`
+	} `json:"face"`
+}
+
+// UnmarshalJSON flattens the wire format's nested "face" object into
+// FrameMetadata's flat FaceX/Y/Width/Height fields.
+func (f *FrameMetadata) UnmarshalJSON(data []byte) error {
+	var wire frameMetadataWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	*f = FrameMetadata{
+		Timestamp:    wire.Timestamp,
+		FakeScore:    wire.FakeScore,
+		FaceDetected: wire.FaceDetected,
+	}
+
+	if wire.Face != nil {
+		f.FaceX = wire.Face.X
+		f.FaceY = wire.Face.Y
+		f.FaceWidth = wire.Face.Width
+		f.FaceHeight = wire.Face.Height
+	}
+
+	return nil
 }
 
 // FrameResult is the analysis produced by the video-detector's Xception

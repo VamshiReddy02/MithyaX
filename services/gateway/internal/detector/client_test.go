@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 )
 
 func TestAnalyze_Success(t *testing.T) {
+	// detector.Result now carries a FrameMetadata slice, so it can no
+	// longer be compared with == / != (want is built and compared with
+	// reflect.DeepEqual instead) and can no longer round-trip through
+	// json.Encode(want) — FrameMetadata only implements UnmarshalJSON,
+	// not MarshalJSON, since this client only ever decodes video-detector
+	// responses, never produces them. The server below therefore writes
+	// the video-detector's actual wire shape (nested "face" object) as a
+	// literal JSON string; TestAnalyze_DecodesFrameMetadata below is the
+	// dedicated test for that decoding.
 	want := detector.Result{
 		Video:           "clip.mp4",
 		Frames:          120,
@@ -42,8 +52,74 @@ func TestAnalyze_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze() error = %v", err)
 	}
-	if *got != want {
+	if !reflect.DeepEqual(*got, want) {
 		t.Errorf("Analyze() = %+v, want %+v", *got, want)
+	}
+}
+
+// TestAnalyze_DecodesFrameMetadata proves the client correctly decodes
+// the video-detector's actual /analyze wire format for frame_metadata:
+// a nested "face" object (or null) rather than flat fields, mirroring
+// the real Python response shape from services/video-detector.
+func TestAnalyze_DecodesFrameMetadata(t *testing.T) {
+	const body = `{
+		"video": "clip.mp4",
+		"frames": 195,
+		"faces_detected": 194,
+		"fake_score": 0.08,
+		"fake_mean": 0.07,
+		"fake_median": 0.06,
+		"fake_p75": 0.09,
+		"fake_p90": 0.12,
+		"fake_max": 0.4,
+		"embedding_frames": 194,
+		"verdict": "real",
+		"frame_metadata": [
+			{
+				"timestamp": 0.0,
+				"fake_score": 0.08,
+				"face_detected": true,
+				"face": {"x": 120, "y": 80, "width": 180, "height": 220}
+			},
+			{
+				"timestamp": 0.04,
+				"fake_score": 0.0,
+				"face_detected": false,
+				"face": null
+			}
+		]
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	got, err := client.Analyze(context.Background(), "https://example.com/clip.mp4")
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+
+	want := []detector.FrameMetadata{
+		{
+			Timestamp:    0.0,
+			FakeScore:    0.08,
+			FaceDetected: true,
+			FaceX:        120,
+			FaceY:        80,
+			FaceWidth:    180,
+			FaceHeight:   220,
+		},
+		{
+			Timestamp:    0.04,
+			FakeScore:    0.0,
+			FaceDetected: false,
+		},
+	}
+	if !reflect.DeepEqual(got.FrameMetadata, want) {
+		t.Errorf("FrameMetadata = %+v, want %+v", got.FrameMetadata, want)
 	}
 }
 

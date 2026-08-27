@@ -42,6 +42,29 @@ type Config struct {
 	// JobTTL bounds how long a job's state is kept in Redis after its
 	// last update, before being automatically cleaned up.
 	JobTTL time.Duration
+	// RealtimeMaxVideoQueue bounds how many frames a live session will
+	// hold waiting for a video worker. Once full, the oldest queued
+	// frame is dropped in favor of the newest — see internal/realtime.
+	RealtimeMaxVideoQueue int
+	// RealtimeVideoWorkers is how many goroutines per live session pull
+	// frames off the video queue and call the video-detector
+	// concurrently.
+	RealtimeVideoWorkers int
+	// RealtimeMaxAudioQueue bounds how many audio chunks a live session
+	// will hold waiting for an audio worker. Unlike video, a full audio
+	// queue rejects the new chunk rather than dropping an old one —
+	// silently discarding part of a speech stream distorts the
+	// analysis, so overload is surfaced to the caller instead.
+	RealtimeMaxAudioQueue int
+	// RealtimeAudioWorkers is how many goroutines per live session pull
+	// chunks off the audio queue and call the audio-detector
+	// concurrently.
+	RealtimeAudioWorkers int
+	// RealtimeMaxSessions bounds how many live analysis sessions this
+	// process will run at once, protecting it from unbounded goroutine/
+	// memory growth if far more sessions are created than the detector
+	// services can actually keep up with.
+	RealtimeMaxSessions int
 }
 
 const (
@@ -58,6 +81,11 @@ const (
 	defaultWorkerQueueSize       = 64
 	defaultRedisAddr             = "localhost:6379"
 	defaultJobTTL                = 24 * time.Hour
+	defaultRealtimeMaxVideoQueue = 10
+	defaultRealtimeVideoWorkers  = 2
+	defaultRealtimeMaxAudioQueue = 10
+	defaultRealtimeAudioWorkers  = 2
+	defaultRealtimeMaxSessions   = 100
 )
 
 // Load builds a Config from environment variables, falling back to defaults
@@ -77,6 +105,11 @@ func Load() (Config, error) {
 		WorkerQueueSize:       defaultWorkerQueueSize,
 		RedisAddr:             getEnv("GATEWAY_REDIS_ADDR", defaultRedisAddr),
 		JobTTL:                defaultJobTTL,
+		RealtimeMaxVideoQueue: defaultRealtimeMaxVideoQueue,
+		RealtimeVideoWorkers:  defaultRealtimeVideoWorkers,
+		RealtimeMaxAudioQueue: defaultRealtimeMaxAudioQueue,
+		RealtimeAudioWorkers:  defaultRealtimeAudioWorkers,
+		RealtimeMaxSessions:   defaultRealtimeMaxSessions,
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -135,6 +168,23 @@ func Load() (Config, error) {
 		cfg.JobTTL = d
 	}
 
+	var err error
+	if cfg.RealtimeMaxVideoQueue, err = positiveIntEnv("REALTIME_MAX_VIDEO_QUEUE", cfg.RealtimeMaxVideoQueue); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealtimeVideoWorkers, err = positiveIntEnv("REALTIME_VIDEO_WORKERS", cfg.RealtimeVideoWorkers); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealtimeMaxAudioQueue, err = positiveIntEnv("REALTIME_MAX_AUDIO_QUEUE", cfg.RealtimeMaxAudioQueue); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealtimeAudioWorkers, err = positiveIntEnv("REALTIME_AUDIO_WORKERS", cfg.RealtimeAudioWorkers); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealtimeMaxSessions, err = positiveIntEnv("REALTIME_MAX_SESSIONS", cfg.RealtimeMaxSessions); err != nil {
+		return Config{}, err
+	}
+
 	if _, err := strconv.Atoi(cfg.Port); err != nil {
 		return Config{}, fmt.Errorf("invalid GATEWAY_PORT %q: must be numeric", cfg.Port)
 	}
@@ -160,4 +210,18 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// positiveIntEnv reads key as a positive integer, returning fallback
+// unchanged if key isn't set.
+func positiveIntEnv(key string, fallback int) (int, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", key, raw)
+	}
+	return n, nil
 }

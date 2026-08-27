@@ -130,8 +130,10 @@ func TestAnalyzeSession_Success(t *testing.T) {
 		t.Errorf("Audio = %+v, want Verdict=fake", body.Audio)
 	}
 
-	// (0.08*0.5 + 0.91*0.5) = 0.495, at the default 50/50 weights.
-	const wantRiskScore = 0.495
+	// Tied to risk.DefaultWeights rather than a hardcoded number, so this
+	// doesn't go stale if the weights are retuned later.
+	w := risk.DefaultWeights
+	wantRiskScore := (0.08*w.Video + 0.91*w.Audio) / (w.Video + w.Audio)
 	if diff := body.Risk.RiskScore - wantRiskScore; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("Risk.RiskScore = %v, want %v", body.Risk.RiskScore, wantRiskScore)
 	}

@@ -31,11 +31,13 @@ type Thresholds struct {
 // instead of snapping straight from authentic to fake at one point.
 var DefaultThresholds = Thresholds{Suspicious: 0.3, LikelyFake: 0.6}
 
-// DefaultSignalThreshold is the per-modality fake-score cutoff above
-// which that modality's own signal gets called out in Reasons. It
-// mirrors the audio- and video-detector services' own fake/real
-// threshold, so a reason fires exactly when that modality would have
-// called the input "fake" on its own.
+// DefaultSignalThreshold is the per-signal score cutoff above which
+// that signal gets called out in Reasons. For video and audio it
+// mirrors those detector services' own fake/real threshold, so a reason
+// fires exactly when that modality would have called the input "fake"
+// on its own; temporal's Score is on the same [0, 1] scale by
+// construction, so the same cutoff is reused until evaluation data
+// suggests otherwise.
 const DefaultSignalThreshold = 0.5
 
 // classify maps a risk score to a Verdict. ok must be the same value
@@ -56,8 +58,8 @@ func classify(score float64, ok bool, t Thresholds) Verdict {
 }
 
 // buildReasons explains what drove (or limited) the assessment: which
-// modalities individually crossed the fake threshold, and which
-// modalities were unavailable and why.
+// signals individually crossed the fake threshold, and which signals
+// were unavailable and why.
 func buildReasons(sig Signals, signalThreshold float64) []string {
 	var reasons []string
 
@@ -67,13 +69,20 @@ func buildReasons(sig Signals, signalThreshold float64) []string {
 	if sig.VideoOK && sig.Video >= signalThreshold {
 		reasons = append(reasons, "Video signal indicates likely synthetic or manipulated content")
 	}
+	if sig.TemporalOK && sig.Temporal >= signalThreshold {
+		reasons = append(reasons, "Temporal signal indicates suspicious frame-to-frame behavior")
+	}
 	if sig.VideoError != "" {
 		reasons = append(reasons, fmt.Sprintf("Video analysis unavailable: %s", sig.VideoError))
 	}
 	if sig.AudioError != "" {
 		reasons = append(reasons, fmt.Sprintf("Audio analysis unavailable: %s", sig.AudioError))
 	}
-	if !sig.VideoOK && !sig.AudioOK && sig.VideoError == "" && sig.AudioError == "" {
+	if sig.TemporalError != "" {
+		reasons = append(reasons, fmt.Sprintf("Temporal analysis unavailable: %s", sig.TemporalError))
+	}
+	if !sig.VideoOK && !sig.AudioOK && !sig.TemporalOK &&
+		sig.VideoError == "" && sig.AudioError == "" && sig.TemporalError == "" {
 		reasons = append(reasons, "No analysis signals were available")
 	}
 

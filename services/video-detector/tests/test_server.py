@@ -100,6 +100,23 @@ def test_analyze_real_video(client, video_server):
     assert 0.0 <= body["fake_score"] <= 1.0
     assert body["verdict"] in {"real", "fake"}
 
+    frame_metadata = body["frame_metadata"]
+    assert 0 < len(frame_metadata) <= 60
+
+    timestamps = [entry["timestamp"] for entry in frame_metadata]
+    assert timestamps == sorted(timestamps)
+
+    for entry in frame_metadata:
+        assert 0.0 <= entry["fake_score"] <= 1.0
+        assert isinstance(entry["face_detected"], bool)
+
+        if entry["face_detected"]:
+            assert entry["face"] is not None
+            for key in ("x", "y", "width", "height"):
+                assert entry["face"][key] >= 0.0
+        else:
+            assert entry["face"] is None
+
 
 def _first_frame_jpeg(video_path: Path) -> bytes:
     cap = cv2.VideoCapture(str(video_path))

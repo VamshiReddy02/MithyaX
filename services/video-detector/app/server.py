@@ -11,7 +11,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, HttpUrl
 
-from app.diagnostic import analyze_video, extract_face
+from app.diagnostic import analyze_video, extract_face, sample_frame_metadata
 from app.embedding import FaceEmbeddingModel
 from app.face import FaceDetector
 from app.model import DeepfakeDetector
@@ -44,6 +44,20 @@ class AnalyzeRequest(BaseModel):
     video_url: HttpUrl
 
 
+class FaceBox(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class FrameMetadataResponse(BaseModel):
+    timestamp: float
+    fake_score: float
+    face_detected: bool
+    face: FaceBox | None = None
+
+
 class AnalyzeResponse(BaseModel):
     video: str
     frames: int
@@ -56,6 +70,10 @@ class AnalyzeResponse(BaseModel):
     fake_max: float
     embedding_frames: int
     verdict: str
+    # A downsampled, evenly-spaced subset of frame_metadata — see
+    # sample_frame_metadata. Named separately from "frames" (the total
+    # frame count above) to avoid ambiguity between the two.
+    frame_metadata: list[FrameMetadataResponse]
 
 
 class FrameAnalysisResponse(BaseModel):
@@ -90,6 +108,8 @@ def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
 
     fake_score = report["fake_score"]
 
+    sampled_frames = sample_frame_metadata(report["frame_metadata"])
+
     return AnalyzeResponse(
         video=video_name,
         frames=report["frames"],
@@ -102,6 +122,7 @@ def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
         fake_max=report["fake_max"],
         embedding_frames=report["embedding_frames"],
         verdict="fake" if fake_score >= FAKE_THRESHOLD else "real",
+        frame_metadata=[_frame_metadata_response(entry) for entry in sampled_frames],
     )
 
 
@@ -124,6 +145,25 @@ async def analyze_frame(request: Request) -> FrameAnalysisResponse:
         face_detected=True,
         fake_probability=fake_probability,
         verdict="fake" if fake_probability >= FAKE_THRESHOLD else "real",
+    )
+
+
+def _frame_metadata_response(entry: dict) -> FrameMetadataResponse:
+    face = None
+
+    if entry["face_detected"]:
+        face = FaceBox(
+            x=entry["face_x"],
+            y=entry["face_y"],
+            width=entry["face_width"],
+            height=entry["face_height"],
+        )
+
+    return FrameMetadataResponse(
+        timestamp=entry["timestamp"],
+        fake_score=entry["fake_score"],
+        face_detected=entry["face_detected"],
+        face=face,
     )
 
 

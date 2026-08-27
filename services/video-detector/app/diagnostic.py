@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -18,15 +19,48 @@ VIDEO_EXTENSIONS = {
     ".webm",
 }
 
+# Fallback used when a video's container doesn't report a usable FPS
+# (some webm/mkv sources report 0). Only affects the per-frame
+# timestamps in FrameMetadata — it doesn't touch the aggregate score.
+DEFAULT_FPS = 30.0
 
-def extract_face(
+# How many frame-metadata entries analyze() returns over the API. The
+# analysis loop itself still processes every frame — this only bounds
+# what's sent back through the gateway, since a 30-second clip can
+# easily produce hundreds or thousands of frames and the temporal
+# analyzer only needs a representative, evenly-spaced sample of them.
+MAX_FRAME_METADATA = 60
+
+
+@dataclass
+class FrameMetadata:
+    """
+    One analyzed frame's metadata — the per-frame signal the Go
+    temporal analyzer (internal/temporal.Frame) needs, one field for
+    one field.
+
+    face_x/y/width/height are 0.0 when face_detected is False; there's
+    no box to report.
+    """
+
+    timestamp: float
+    fake_score: float
+    face_detected: bool
+    face_x: float = 0.0
+    face_y: float = 0.0
+    face_width: float = 0.0
+    face_height: float = 0.0
+
+
+def _detect_face_box(
     frame: np.ndarray,
     face_detector: FaceDetector,
 ):
     """
-    Detect the largest face in a frame.
+    Detect the largest face in a frame and return its bounding box,
+    clipped to the frame.
 
-    Returns the face crop.
+    Returns (x, y, width, height), or None if no face was found.
     """
 
     faces = face_detector.detect(frame)
@@ -64,10 +98,69 @@ def extract_face(
     if x2 <= x1 or y2 <= y1:
         return None
 
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def extract_face(
+    frame: np.ndarray,
+    face_detector: FaceDetector,
+):
+    """
+    Detect the largest face in a frame.
+
+    Returns the face crop.
+    """
+
+    box = _detect_face_box(frame, face_detector)
+
+    if box is None:
+        return None
+
+    x, y, w, h = box
+
     return frame[
-        y1:y2,
-        x1:x2,
+        y:y + h,
+        x:x + w,
     ]
+
+
+def sample_frame_metadata(
+    entries: list[dict],
+    max_samples: int = MAX_FRAME_METADATA,
+):
+    """
+    Evenly downsample frame metadata down to at most max_samples
+    entries, always keeping the first and last frame.
+
+    This is purely a transport-size decision: it exists so /analyze
+    doesn't ship hundreds or thousands of entries through the gateway
+    for a long clip. It has no effect on the aggregate video score,
+    which is computed from every frame before this ever runs.
+    """
+
+    total = len(entries)
+
+    if total <= max_samples or max_samples <= 1:
+        return list(entries)
+
+    indices = [
+        round(i * (total - 1) / (max_samples - 1))
+        for i in range(max_samples)
+    ]
+
+    # Rounding can repeat an index when max_samples is close to total;
+    # de-duplicate while preserving chronological order.
+    seen = set()
+    sampled = []
+
+    for index in indices:
+        if index in seen:
+            continue
+
+        seen.add(index)
+        sampled.append(entries[index])
+
+    return sampled
 
 
 def robust_fake_score(
@@ -152,11 +245,17 @@ def analyze_video(
             f"Could not open video: {video_path}"
         )
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not fps or fps <= 0:
+        fps = DEFAULT_FPS
+
     frame_count = 0
     faces_detected = 0
 
     fake_probabilities = []
     embeddings = []
+    frame_metadata: list[FrameMetadata] = []
 
     while True:
         ok, frame = cap.read()
@@ -165,14 +264,28 @@ def analyze_video(
             break
 
         frame_count += 1
+        timestamp = (frame_count - 1) / fps
 
-        face = extract_face(
+        box = _detect_face_box(
             frame,
             face_detector,
         )
 
-        if face is None:
+        if box is None:
+            frame_metadata.append(
+                FrameMetadata(
+                    timestamp=timestamp,
+                    fake_score=0.0,
+                    face_detected=False,
+                )
+            )
             continue
+
+        face_x, face_y, face_width, face_height = box
+        face = frame[
+            face_y:face_y + face_height,
+            face_x:face_x + face_width,
+        ]
 
         faces_detected += 1
 
@@ -190,6 +303,18 @@ def analyze_video(
 
         fake_probabilities.append(
             fake_probability
+        )
+
+        frame_metadata.append(
+            FrameMetadata(
+                timestamp=timestamp,
+                fake_score=fake_probability,
+                face_detected=True,
+                face_x=float(face_x),
+                face_y=float(face_y),
+                face_width=float(face_width),
+                face_height=float(face_height),
+            )
         )
 
         # --------------------------------
@@ -213,6 +338,10 @@ def analyze_video(
 
     cap.release()
 
+    frame_metadata_dicts = [
+        asdict(entry) for entry in frame_metadata
+    ]
+
     if not fake_probabilities:
         return {
             "video": video_path.name,
@@ -227,6 +356,7 @@ def analyze_video(
             "embedding_frames": 0,
             "embedding_consistency": None,
             "temporal_changes": None,
+            "frame_metadata": frame_metadata_dicts,
         }
 
     probabilities = np.asarray(
@@ -319,6 +449,8 @@ def analyze_video(
         "embedding_consistency": consistency,
 
         "temporal_changes": temporal,
+
+        "frame_metadata": frame_metadata_dicts,
     }
 
 

@@ -1,14 +1,16 @@
-// Package risk turns a completed analysis session's per-modality fake
+// Package risk turns a completed analysis session's per-signal fake
 // scores into a single risk assessment: a weighted score, a verdict
 // bucket, and the reasons behind it.
 package risk
 
 import "github.com/vamshireddy02/mithyax/gateway/internal/session"
 
-// Signals is the risk engine's input. It's a flat copy of the two
-// modality scores rather than *session.AnalysisSession directly, so
-// score.go and verdict.go stay simple pure functions that don't need to
-// know how the session package models "missing".
+// Signals is the risk engine's input: video and audio's fake scores,
+// plus temporal's frame-to-frame anomaly score. It's a flat copy rather
+// than *session.AnalysisSession directly, so score.go and verdict.go
+// stay simple pure functions that don't need to know how the session
+// package models "missing" — and so a caller can supply a temporal
+// score without session needing to know about the temporal package.
 type Signals struct {
 	Video      float64
 	VideoOK    bool
@@ -17,9 +19,17 @@ type Signals struct {
 	Audio      float64
 	AudioOK    bool
 	AudioError string
+
+	Temporal      float64
+	TemporalOK    bool
+	TemporalError string
 }
 
 // FromSession builds Signals from a completed AnalysisSession.
+// AnalysisSession has no TemporalError of its own — temporal analysis
+// runs locally and can't fail the way a call to the video/audio
+// detector services can — so TemporalOK is simply whether the session
+// carries a temporal result at all.
 func FromSession(s *session.AnalysisSession) Signals {
 	sig := Signals{VideoError: s.VideoError, AudioError: s.AudioError}
 	if s.Video != nil {
@@ -30,14 +40,19 @@ func FromSession(s *session.AnalysisSession) Signals {
 		sig.Audio = s.Audio.FakeScore
 		sig.AudioOK = true
 	}
+	if s.Temporal != nil {
+		sig.Temporal = s.Temporal.Score
+		sig.TemporalOK = true
+	}
 	return sig
 }
 
-// SignalScores reports the individual fake scores that fed a risk
-// score, omitting whichever modality wasn't available.
+// SignalScores reports the individual scores that fed a risk score,
+// omitting whichever signal wasn't available.
 type SignalScores struct {
-	Video *float64 `json:"video,omitempty"`
-	Audio *float64 `json:"audio,omitempty"`
+	Video    *float64 `json:"video,omitempty"`
+	Audio    *float64 `json:"audio,omitempty"`
+	Temporal *float64 `json:"temporal,omitempty"`
 }
 
 // Assessment is the risk engine's output.
@@ -76,7 +91,11 @@ func (e *Engine) Assess(s *session.AnalysisSession) Assessment {
 // the seam engine_test.go uses to exercise the engine's logic without
 // having to construct a session.AnalysisSession.
 func (e *Engine) AssessSignals(sig Signals) Assessment {
-	score, ok := weightedScore(sig.Video, sig.VideoOK, sig.Audio, sig.AudioOK, e.weights)
+	score, ok := weightedScore(
+		signalInput{score: sig.Video, present: sig.VideoOK, weight: e.weights.Video},
+		signalInput{score: sig.Audio, present: sig.AudioOK, weight: e.weights.Audio},
+		signalInput{score: sig.Temporal, present: sig.TemporalOK, weight: e.weights.Temporal},
+	)
 
 	assessment := Assessment{
 		RiskScore: score,
@@ -90,6 +109,10 @@ func (e *Engine) AssessSignals(sig Signals) Assessment {
 	if sig.AudioOK {
 		audio := sig.Audio
 		assessment.Signals.Audio = &audio
+	}
+	if sig.TemporalOK {
+		temporal := sig.Temporal
+		assessment.Signals.Temporal = &temporal
 	}
 	return assessment
 }

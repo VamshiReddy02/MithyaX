@@ -44,6 +44,21 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.WorkerShutdownTimeout != defaultWorkerShutdownTimeout {
 		t.Errorf("WorkerShutdownTimeout = %v, want %v", cfg.WorkerShutdownTimeout, defaultWorkerShutdownTimeout)
 	}
+	if cfg.RealtimeMaxVideoQueue != defaultRealtimeMaxVideoQueue {
+		t.Errorf("RealtimeMaxVideoQueue = %d, want %d", cfg.RealtimeMaxVideoQueue, defaultRealtimeMaxVideoQueue)
+	}
+	if cfg.RealtimeVideoWorkers != defaultRealtimeVideoWorkers {
+		t.Errorf("RealtimeVideoWorkers = %d, want %d", cfg.RealtimeVideoWorkers, defaultRealtimeVideoWorkers)
+	}
+	if cfg.RealtimeMaxAudioQueue != defaultRealtimeMaxAudioQueue {
+		t.Errorf("RealtimeMaxAudioQueue = %d, want %d", cfg.RealtimeMaxAudioQueue, defaultRealtimeMaxAudioQueue)
+	}
+	if cfg.RealtimeAudioWorkers != defaultRealtimeAudioWorkers {
+		t.Errorf("RealtimeAudioWorkers = %d, want %d", cfg.RealtimeAudioWorkers, defaultRealtimeAudioWorkers)
+	}
+	if cfg.RealtimeMaxSessions != defaultRealtimeMaxSessions {
+		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, defaultRealtimeMaxSessions)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -58,6 +73,11 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_WORKER_COUNT", "8")
 	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "256")
 	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "3m")
+	t.Setenv("REALTIME_MAX_VIDEO_QUEUE", "20")
+	t.Setenv("REALTIME_VIDEO_WORKERS", "4")
+	t.Setenv("REALTIME_MAX_AUDIO_QUEUE", "15")
+	t.Setenv("REALTIME_AUDIO_WORKERS", "3")
+	t.Setenv("REALTIME_MAX_SESSIONS", "50")
 
 	cfg, err := Load()
 	if err != nil {
@@ -96,6 +116,61 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.WorkerShutdownTimeout != 3*time.Minute {
 		t.Errorf("WorkerShutdownTimeout = %v, want %v", cfg.WorkerShutdownTimeout, 3*time.Minute)
+	}
+	if cfg.RealtimeMaxVideoQueue != 20 {
+		t.Errorf("RealtimeMaxVideoQueue = %d, want %d", cfg.RealtimeMaxVideoQueue, 20)
+	}
+	if cfg.RealtimeVideoWorkers != 4 {
+		t.Errorf("RealtimeVideoWorkers = %d, want %d", cfg.RealtimeVideoWorkers, 4)
+	}
+	if cfg.RealtimeMaxAudioQueue != 15 {
+		t.Errorf("RealtimeMaxAudioQueue = %d, want %d", cfg.RealtimeMaxAudioQueue, 15)
+	}
+	if cfg.RealtimeAudioWorkers != 3 {
+		t.Errorf("RealtimeAudioWorkers = %d, want %d", cfg.RealtimeAudioWorkers, 3)
+	}
+	if cfg.RealtimeMaxSessions != 50 {
+		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, 50)
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxVideoQueue(t *testing.T) {
+	t.Setenv("REALTIME_MAX_VIDEO_QUEUE", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with REALTIME_MAX_VIDEO_QUEUE=0: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeVideoWorkers(t *testing.T) {
+	t.Setenv("REALTIME_VIDEO_WORKERS", "not-a-number")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid REALTIME_VIDEO_WORKERS: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxAudioQueue(t *testing.T) {
+	t.Setenv("REALTIME_MAX_AUDIO_QUEUE", "-1")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with REALTIME_MAX_AUDIO_QUEUE=-1: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeAudioWorkers(t *testing.T) {
+	t.Setenv("REALTIME_AUDIO_WORKERS", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with REALTIME_AUDIO_WORKERS=0: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxSessions(t *testing.T) {
+	t.Setenv("REALTIME_MAX_SESSIONS", "nope")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid REALTIME_MAX_SESSIONS: expected error, got nil")
 	}
 }
 
