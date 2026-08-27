@@ -1,7 +1,8 @@
-"""Audio file loading and decoding.
+"""Audio file decoding.
 
-WAV only for now — no MP3/M4A/WebM support yet. That's future scope, not
-this step.
+WAV only for now — MP3/WebM support is future scope. decode_audio is
+already the single entry point the rest of the pipeline calls, so adding
+those later means adding a branch here, not restructuring callers.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ _DTYPE_FOR_SAMPLE_WIDTH = {
 
 
 class InvalidAudioError(ValueError):
-    """Raised when uploaded audio can't be decoded as a valid WAV file."""
+    """Raised when uploaded audio can't be decoded."""
 
 
 @dataclass
@@ -35,13 +36,12 @@ class DecodedAudio:
     duration: float
 
 
-def load_wav(data: bytes) -> DecodedAudio:
-    """
-    Decode raw WAV bytes into a waveform plus its metadata.
+def decode_audio(data: bytes) -> DecodedAudio:
+    """Decode uploaded audio bytes into a waveform plus its metadata."""
+    return _decode_wav(data)
 
-    Raises InvalidAudioError if data isn't a readable WAV file, has no
-    audio frames, or uses a sample width we don't recognize.
-    """
+
+def _decode_wav(data: bytes) -> DecodedAudio:
     try:
         with wave.open(io.BytesIO(data), "rb") as wav_file:
             channels = wav_file.getnchannels()

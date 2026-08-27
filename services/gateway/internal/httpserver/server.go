@@ -9,10 +9,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/middleware"
+	"github.com/vamshireddy02/mithyax/gateway/internal/session"
 	"github.com/vamshireddy02/mithyax/gateway/internal/websocket"
 	"github.com/vamshireddy02/mithyax/gateway/internal/worker"
 )
@@ -36,6 +38,7 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 	router.Use(middleware.Logging(logger), middleware.CORS(), gin.Recovery())
 
 	detectorClient := detector.NewClient(cfg.DetectorBaseURL, cfg.DetectorTimeout)
+	audioClient := audio.NewClient(cfg.AudioDetectorBaseURL, cfg.AudioDetectorTimeout)
 	signalingHub := websocket.NewHub()
 
 	redisClient := redis.NewClient(&redis.Options{
@@ -48,12 +51,16 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
 	pool.Start(cfg.WorkerCount)
 
+	sessionService := session.NewService(detectorClient, audioClient, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
+
 	router.GET("/health", handlers.Health)
 
 	v1 := router.Group("/api/v1")
 	v1.POST("/analyze", handlers.NewAnalyze(pool))
 	v1.GET("/analyze/:id", handlers.NewJobStatus(jobStore))
 	v1.POST("/analyze-frame", handlers.NewAnalyzeFrame(detectorClient))
+	v1.POST("/analyze-audio", handlers.NewAnalyzeAudio(audioClient))
+	v1.POST("/analyze-session", handlers.NewAnalyzeSession(sessionService))
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
 
 	return &Server{

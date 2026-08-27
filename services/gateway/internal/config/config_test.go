@@ -29,6 +29,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DetectorTimeout != defaultDetectorTimeout {
 		t.Errorf("DetectorTimeout = %v, want %v", cfg.DetectorTimeout, defaultDetectorTimeout)
 	}
+	if cfg.AudioDetectorBaseURL != defaultAudioDetectorBaseURL {
+		t.Errorf("AudioDetectorBaseURL = %q, want %q", cfg.AudioDetectorBaseURL, defaultAudioDetectorBaseURL)
+	}
+	if cfg.AudioDetectorTimeout != defaultAudioDetectorTimeout {
+		t.Errorf("AudioDetectorTimeout = %v, want %v", cfg.AudioDetectorTimeout, defaultAudioDetectorTimeout)
+	}
 	if cfg.WorkerCount != defaultWorkerCount {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, defaultWorkerCount)
 	}
@@ -47,6 +53,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_SHUTDOWN_TIMEOUT", "5s")
 	t.Setenv("GATEWAY_DETECTOR_URL", "http://detector:9000")
 	t.Setenv("GATEWAY_DETECTOR_TIMEOUT", "30s")
+	t.Setenv("GATEWAY_AUDIO_DETECTOR_URL", "http://audio-detector:9001")
+	t.Setenv("GATEWAY_AUDIO_DETECTOR_TIMEOUT", "45s")
 	t.Setenv("GATEWAY_WORKER_COUNT", "8")
 	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "256")
 	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "3m")
@@ -73,6 +81,12 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.DetectorTimeout != 30*time.Second {
 		t.Errorf("DetectorTimeout = %v, want %v", cfg.DetectorTimeout, 30*time.Second)
+	}
+	if cfg.AudioDetectorBaseURL != "http://audio-detector:9001" {
+		t.Errorf("AudioDetectorBaseURL = %q, want %q", cfg.AudioDetectorBaseURL, "http://audio-detector:9001")
+	}
+	if cfg.AudioDetectorTimeout != 45*time.Second {
+		t.Errorf("AudioDetectorTimeout = %v, want %v", cfg.AudioDetectorTimeout, 45*time.Second)
 	}
 	if cfg.WorkerCount != 8 {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, 8)
@@ -114,6 +128,22 @@ func TestLoad_InvalidDetectorTimeout(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with invalid GATEWAY_DETECTOR_TIMEOUT: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidAudioDetectorURL(t *testing.T) {
+	t.Setenv("GATEWAY_AUDIO_DETECTOR_URL", "not-a-url")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_AUDIO_DETECTOR_URL: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidAudioDetectorTimeout(t *testing.T) {
+	t.Setenv("GATEWAY_AUDIO_DETECTOR_TIMEOUT", "not-a-duration")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_AUDIO_DETECTOR_TIMEOUT: expected error, got nil")
 	}
 }
 

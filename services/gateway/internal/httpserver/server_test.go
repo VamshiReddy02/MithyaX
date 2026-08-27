@@ -1,10 +1,12 @@
 package httpserver_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
+	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
@@ -30,6 +33,20 @@ func TestServer_Routes(t *testing.T) {
 	}))
 	defer fakeDetector.Close()
 
+	fakeAudioDetector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(audio.Result{
+			DurationSeconds: 4.6,
+			SampleRate:      16000,
+			Channels:        1,
+			Chunks:          2,
+			Status:          "processed",
+			FakeScore:       0.97,
+			Verdict:         "fake",
+		})
+	}))
+	defer fakeAudioDetector.Close()
+
 	mr, err := miniredis.Run()
 	if err != nil {
 		t.Fatalf("miniredis.Run() error = %v", err)
@@ -38,14 +55,16 @@ func TestServer_Routes(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httpserver.New(config.Config{
-		Port:            "0",
-		Environment:     "test",
-		DetectorBaseURL: fakeDetector.URL,
-		DetectorTimeout: 5 * time.Second,
-		WorkerCount:     2,
-		WorkerQueueSize: 8,
-		RedisAddr:       mr.Addr(),
-		JobTTL:          time.Hour,
+		Port:                 "0",
+		Environment:          "test",
+		DetectorBaseURL:      fakeDetector.URL,
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorBaseURL: fakeAudioDetector.URL,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          2,
+		WorkerQueueSize:      8,
+		RedisAddr:            mr.Addr(),
+		JobTTL:               time.Hour,
 	}, logger)
 	defer srv.Pool.Shutdown(context.Background())
 	defer srv.Redis.Close()
@@ -128,5 +147,38 @@ func TestServer_Routes(t *testing.T) {
 	defer resp5.Body.Close()
 	if resp5.StatusCode != http.StatusNotFound {
 		t.Errorf("GET /api/v1/analyze/does-not-exist status = %d, want %d", resp5.StatusCode, http.StatusNotFound)
+	}
+
+	// POST /api/v1/analyze-audio: real multipart upload through the real
+	// server, proving the gateway -> Python audio-detector relay works
+	// end to end, not just that the handler/client units work in isolation.
+	audioBody := &bytes.Buffer{}
+	audioWriter := multipart.NewWriter(audioBody)
+	part, err := audioWriter.CreateFormFile("audio", "clip.wav")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte("fake-wav-bytes")); err != nil {
+		t.Fatalf("part.Write: %v", err)
+	}
+	if err := audioWriter.Close(); err != nil {
+		t.Fatalf("audioWriter.Close: %v", err)
+	}
+
+	resp6, err := http.Post(ts.URL+"/api/v1/analyze-audio", audioWriter.FormDataContentType(), audioBody)
+	if err != nil {
+		t.Fatalf("POST /api/v1/analyze-audio: %v", err)
+	}
+	defer resp6.Body.Close()
+	if resp6.StatusCode != http.StatusOK {
+		t.Errorf("POST /api/v1/analyze-audio status = %d, want %d", resp6.StatusCode, http.StatusOK)
+	}
+
+	var audioResult audio.Result
+	if err := json.NewDecoder(resp6.Body).Decode(&audioResult); err != nil {
+		t.Fatalf("decode POST /api/v1/analyze-audio response: %v", err)
+	}
+	if audioResult.Verdict != "fake" || audioResult.Chunks != 2 {
+		t.Errorf("audioResult = %+v, want Verdict=fake Chunks=2", audioResult)
 	}
 }

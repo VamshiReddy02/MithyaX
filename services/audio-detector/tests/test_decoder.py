@@ -6,7 +6,7 @@ import wave
 import numpy as np
 import pytest
 
-from app.audio.loader import InvalidAudioError, load_wav
+from app.audio.decoder import InvalidAudioError, decode_audio
 
 
 def make_wav_bytes(
@@ -28,7 +28,7 @@ def make_wav_bytes(
 def test_load_valid_wav():
     data = make_wav_bytes(num_frames=16000)
 
-    decoded = load_wav(data)
+    decoded = decode_audio(data)
 
     assert isinstance(decoded.waveform, np.ndarray)
     assert len(decoded.waveform) == 16000
@@ -38,7 +38,7 @@ def test_load_valid_wav():
 def test_audio_metadata():
     data = make_wav_bytes(channels=1, sample_rate=16000, num_frames=32000)
 
-    decoded = load_wav(data)
+    decoded = decode_audio(data)
 
     assert decoded.sample_rate == 16000
     assert decoded.channels == 1
@@ -48,7 +48,7 @@ def test_audio_metadata():
 def test_stereo_wav_reshapes_waveform_per_channel():
     data = make_wav_bytes(channels=2, sample_rate=16000, num_frames=8000)
 
-    decoded = load_wav(data)
+    decoded = decode_audio(data)
 
     assert decoded.channels == 2
     assert decoded.waveform.shape == (8000, 2)
@@ -64,14 +64,14 @@ def test_stereo_wav_reshapes_waveform_per_channel():
 )
 def test_invalid_audio(data):
     with pytest.raises(InvalidAudioError):
-        load_wav(data)
+        decode_audio(data)
 
 
 def test_invalid_audio_zero_frames():
     data = make_wav_bytes(num_frames=0)
 
     with pytest.raises(InvalidAudioError):
-        load_wav(data)
+        decode_audio(data)
 
 
 def test_invalid_audio_unsupported_sample_width():
@@ -85,4 +85,4 @@ def test_invalid_audio_unsupported_sample_width():
     data[34] = 24
 
     with pytest.raises(InvalidAudioError):
-        load_wav(bytes(data))
+        decode_audio(bytes(data))

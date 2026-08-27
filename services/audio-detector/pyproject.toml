@@ -9,5 +9,7 @@ dependencies = [
     "numpy>=2.5.2",
     "pytest>=9.1.1",
     "python-multipart>=0.0.32",
+    "torch>=2.13.0",
+    "transformers>=5.16.1",
     "uvicorn>=0.52.4",
 ]

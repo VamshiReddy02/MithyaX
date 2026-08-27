@@ -28,6 +28,10 @@ type Config struct {
 	DetectorBaseURL string
 	// DetectorTimeout bounds how long a single analysis request may take.
 	DetectorTimeout time.Duration
+	// AudioDetectorBaseURL is the base URL of the Python audio-detector service.
+	AudioDetectorBaseURL string
+	// AudioDetectorTimeout bounds how long a single audio analysis request may take.
+	AudioDetectorTimeout time.Duration
 	// WorkerCount is how many goroutines process analyze jobs concurrently.
 	WorkerCount int
 	// WorkerQueueSize bounds how many analyze jobs may be queued at once.
@@ -48,6 +52,8 @@ const (
 	defaultWorkerShutdownTimeout = 2 * time.Minute
 	defaultDetectorBaseURL       = "http://localhost:8000"
 	defaultDetectorTimeout       = 60 * time.Second
+	defaultAudioDetectorBaseURL  = "http://localhost:8001"
+	defaultAudioDetectorTimeout  = 60 * time.Second
 	defaultWorkerCount           = 4
 	defaultWorkerQueueSize       = 64
 	defaultRedisAddr             = "localhost:6379"
@@ -65,6 +71,8 @@ func Load() (Config, error) {
 		WorkerShutdownTimeout: defaultWorkerShutdownTimeout,
 		DetectorBaseURL:       getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
 		DetectorTimeout:       defaultDetectorTimeout,
+		AudioDetectorBaseURL:  getEnv("GATEWAY_AUDIO_DETECTOR_URL", defaultAudioDetectorBaseURL),
+		AudioDetectorTimeout:  defaultAudioDetectorTimeout,
 		WorkerCount:           defaultWorkerCount,
 		WorkerQueueSize:       defaultWorkerQueueSize,
 		RedisAddr:             getEnv("GATEWAY_REDIS_ADDR", defaultRedisAddr),
@@ -85,6 +93,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid GATEWAY_DETECTOR_TIMEOUT %q: %w", raw, err)
 		}
 		cfg.DetectorTimeout = d
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_AUDIO_DETECTOR_TIMEOUT"); ok {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid GATEWAY_AUDIO_DETECTOR_TIMEOUT %q: %w", raw, err)
+		}
+		cfg.AudioDetectorTimeout = d
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT"); ok {
@@ -125,6 +141,10 @@ func Load() (Config, error) {
 
 	if _, err := url.ParseRequestURI(cfg.DetectorBaseURL); err != nil {
 		return Config{}, fmt.Errorf("invalid GATEWAY_DETECTOR_URL %q: %w", cfg.DetectorBaseURL, err)
+	}
+
+	if _, err := url.ParseRequestURI(cfg.AudioDetectorBaseURL); err != nil {
+		return Config{}, fmt.Errorf("invalid GATEWAY_AUDIO_DETECTOR_URL %q: %w", cfg.AudioDetectorBaseURL, err)
 	}
 
 	return cfg, nil
