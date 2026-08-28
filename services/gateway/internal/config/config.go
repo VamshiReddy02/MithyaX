@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -39,6 +40,14 @@ type Config struct {
 	// RedisAddr is the address (host:port) of the Redis instance backing
 	// job state and the job queue.
 	RedisAddr string
+	// DatabaseURL is the PostgreSQL connection string backing persisted
+	// session records (see internal/database, internal/repository/sessions).
+	// Required — see Load, which errors rather than defaulting to any
+	// value, since a DSN carries a real credential (see
+	// deployments/docker/.env.example for local dev setup). Pool sizing
+	// (max/min conns, conn lifetime) intentionally isn't configurable yet
+	// — pgxpool's own defaults are fine until real usage says otherwise.
+	DatabaseURL string
 	// JobTTL bounds how long a job's state is kept in Redis after its
 	// last update, before being automatically cleaned up.
 	JobTTL time.Duration
@@ -88,8 +97,10 @@ const (
 	defaultRealtimeMaxSessions   = 100
 )
 
-// Load builds a Config from environment variables, falling back to defaults
-// for anything unset.
+// Load builds a Config from environment variables, falling back to
+// defaults for anything unset — except GATEWAY_DATABASE_URL, which
+// carries a real credential and so has no default; it must be set
+// explicitly (see deployments/docker/.env.example).
 func Load() (Config, error) {
 	cfg := Config{
 		Port:                  getEnv("GATEWAY_PORT", defaultPort),
@@ -104,6 +115,7 @@ func Load() (Config, error) {
 		WorkerCount:           defaultWorkerCount,
 		WorkerQueueSize:       defaultWorkerQueueSize,
 		RedisAddr:             getEnv("GATEWAY_REDIS_ADDR", defaultRedisAddr),
+		DatabaseURL:           os.Getenv("GATEWAY_DATABASE_URL"),
 		JobTTL:                defaultJobTTL,
 		RealtimeMaxVideoQueue: defaultRealtimeMaxVideoQueue,
 		RealtimeVideoWorkers:  defaultRealtimeVideoWorkers,
@@ -195,6 +207,13 @@ func Load() (Config, error) {
 
 	if _, err := url.ParseRequestURI(cfg.AudioDetectorBaseURL); err != nil {
 		return Config{}, fmt.Errorf("invalid GATEWAY_AUDIO_DETECTOR_URL %q: %w", cfg.AudioDetectorBaseURL, err)
+	}
+
+	if cfg.DatabaseURL == "" {
+		return Config{}, errors.New("GATEWAY_DATABASE_URL is required (see deployments/docker/.env.example)")
+	}
+	if _, err := url.ParseRequestURI(cfg.DatabaseURL); err != nil {
+		return Config{}, fmt.Errorf("invalid GATEWAY_DATABASE_URL %q: %w", cfg.DatabaseURL, err)
 	}
 
 	return cfg, nil

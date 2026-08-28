@@ -4,11 +4,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
 	"github.com/vamshireddy02/mithyax/gateway/internal/httpserver"
@@ -35,7 +37,20 @@ func run() error {
 		slog.String("addr", cfg.Addr()),
 	)
 
-	srv := httpserver.New(cfg, logger)
+	srv, err := httpserver.New(cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	// Run outside httpserver.New so a DB-touching failure here can never
+	// affect building a Server in tests that don't configure a real
+	// database (see httpserver.New's doc comment).
+	migrateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = srv.DB.Migrate(migrateCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("run database migrations: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -83,6 +98,7 @@ func run() error {
 	if err := srv.Redis.Close(); err != nil {
 		logger.Warn("failed to close redis client cleanly", slog.String("error", err.Error()))
 	}
+	srv.DB.Close()
 
 	logger.Info("gateway stopped")
 	return nil

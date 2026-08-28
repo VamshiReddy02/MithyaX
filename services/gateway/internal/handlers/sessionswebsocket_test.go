@@ -21,19 +21,20 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
 )
 
-func newSessionWSTestServer(t *testing.T, store *realtime.Store) (server *httptest.Server, baseURL string) {
+func newSessionWSTestServer(t *testing.T, store *realtime.Store) (server *httptest.Server, baseURL string, repo *fakeSessionRepository) {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router.POST("/api/v1/sessions", handlers.NewCreateSession(store))
-	router.GET("/api/v1/sessions/ws", handlers.NewSessionWebSocket(store, logger))
+	repo = newFakeSessionRepository()
+	router.POST("/api/v1/sessions", handlers.NewCreateSession(store, repo))
+	router.GET("/api/v1/sessions/ws", handlers.NewSessionWebSocket(store, repo, logger))
 
 	server = httptest.NewServer(router)
 	t.Cleanup(server.Close)
 
-	return server, server.URL
+	return server, server.URL, repo
 }
 
 func createSession(t *testing.T, baseURL string) string {
@@ -88,7 +89,7 @@ func TestSessionWebSocket_FullLifecycle(t *testing.T) {
 	video := &fakeRealtimeVideoAnalyzer{result: &detector.FrameResult{FaceDetected: true, FakeProbability: 0.8, Verdict: "fake"}}
 	aud := &fakeRealtimeAudioAnalyzer{result: &audio.Result{FakeScore: 0.9, Verdict: "fake"}}
 	store := realtime.NewStore(video, aud, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL := newSessionWSTestServer(t, store)
+	_, baseURL, repo := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)
@@ -146,11 +147,30 @@ func TestSessionWebSocket_FullLifecycle(t *testing.T) {
 	if _, ok := store.Get(sessionID); ok {
 		t.Error("session still present in store after the connection ended")
 	}
+
+	// And its final result should have been persisted — the whole point
+	// of 7.1.7 is that this record outlives the in-memory session above.
+	persisted, err := repo.Get(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("repo.Get(%s) error = %v, want the session to have been persisted", sessionID, err)
+	}
+	if persisted.Status != "completed" {
+		t.Errorf("persisted.Status = %q, want %q", persisted.Status, "completed")
+	}
+	if persisted.EndedAt == nil {
+		t.Error("persisted.EndedAt is nil, want it set")
+	}
+	if persisted.RiskScore == nil {
+		t.Error("persisted.RiskScore is nil, want it set")
+	}
+	if persisted.Verdict == "" {
+		t.Error("persisted.Verdict is empty, want it set")
+	}
 }
 
 func TestSessionWebSocket_UnknownSessionID_NotFound(t *testing.T) {
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL := newSessionWSTestServer(t, store)
+	_, baseURL, _ := newSessionWSTestServer(t, store)
 
 	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/api/v1/sessions/ws?session_id=does-not-exist"
 	_, resp, err := gorilla.DefaultDialer.Dial(wsURL, nil)
@@ -168,7 +188,7 @@ func TestSessionWebSocket_UnknownSessionID_NotFound(t *testing.T) {
 
 func TestSessionWebSocket_MissingSessionID_BadRequest(t *testing.T) {
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL := newSessionWSTestServer(t, store)
+	_, baseURL, _ := newSessionWSTestServer(t, store)
 
 	resp, err := http.Get(baseURL + "/api/v1/sessions/ws")
 	if err != nil {
@@ -187,7 +207,7 @@ func TestSessionWebSocket_MissingSessionID_BadRequest(t *testing.T) {
 func TestSessionWebSocket_DetectorError_SendsErrorMessageAndStaysOpen(t *testing.T) {
 	video := &erroringVideoAnalyzer{}
 	store := realtime.NewStore(video, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL := newSessionWSTestServer(t, store)
+	_, baseURL, _ := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)
@@ -247,7 +267,7 @@ func TestSessionWebSocket_OverloadedAudioQueue_EmitsOverloadedErrorCode(t *testi
 
 	cfg := realtime.Config{MaxVideoQueue: 5, VideoWorkers: 1, MaxAudioQueue: 1, AudioWorkers: 1, MaxSessions: 10}
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, aud, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, cfg)
-	_, baseURL := newSessionWSTestServer(t, store)
+	_, baseURL, _ := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)

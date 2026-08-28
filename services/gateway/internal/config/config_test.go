@@ -6,6 +6,11 @@ import (
 )
 
 func TestLoad_Defaults(t *testing.T) {
+	// GATEWAY_DATABASE_URL has no default (it carries a real credential —
+	// see TestLoad_MissingDatabaseURL) and so must be set even for a test
+	// that's only checking every other field's default.
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
@@ -34,6 +39,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.AudioDetectorTimeout != defaultAudioDetectorTimeout {
 		t.Errorf("AudioDetectorTimeout = %v, want %v", cfg.AudioDetectorTimeout, defaultAudioDetectorTimeout)
+	}
+	if cfg.DatabaseURL != "postgres://user:pass@localhost:5432/mithyax" {
+		t.Errorf("DatabaseURL = %q, want the value GATEWAY_DATABASE_URL was set to", cfg.DatabaseURL)
 	}
 	if cfg.WorkerCount != defaultWorkerCount {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, defaultWorkerCount)
@@ -70,6 +78,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_DETECTOR_TIMEOUT", "30s")
 	t.Setenv("GATEWAY_AUDIO_DETECTOR_URL", "http://audio-detector:9001")
 	t.Setenv("GATEWAY_AUDIO_DETECTOR_TIMEOUT", "45s")
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@db:5432/mithyax_test")
 	t.Setenv("GATEWAY_WORKER_COUNT", "8")
 	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "256")
 	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "3m")
@@ -107,6 +116,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.AudioDetectorTimeout != 45*time.Second {
 		t.Errorf("AudioDetectorTimeout = %v, want %v", cfg.AudioDetectorTimeout, 45*time.Second)
+	}
+	if cfg.DatabaseURL != "postgres://user:pass@db:5432/mithyax_test" {
+		t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, "postgres://user:pass@db:5432/mithyax_test")
 	}
 	if cfg.WorkerCount != 8 {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, 8)
@@ -211,6 +223,25 @@ func TestLoad_InvalidAudioDetectorURL(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with invalid GATEWAY_AUDIO_DETECTOR_URL: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidDatabaseURL(t *testing.T) {
+	t.Setenv("GATEWAY_DATABASE_URL", "not-a-url")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_DATABASE_URL: expected error, got nil")
+	}
+}
+
+// TestLoad_MissingDatabaseURL proves Load() refuses to start with no
+// database configured at all, rather than quietly falling back to some
+// default connection string — GATEWAY_DATABASE_URL carries a real
+// credential, so unlike every other setting there's nothing safe to
+// default it to.
+func TestLoad_MissingDatabaseURL(t *testing.T) {
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_DATABASE_URL unset: expected error, got nil")
 	}
 }
 

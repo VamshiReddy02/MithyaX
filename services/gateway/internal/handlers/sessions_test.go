@@ -11,6 +11,7 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
+	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 )
 
 type fakeSessionCreator struct {
@@ -25,16 +26,16 @@ func (f *fakeSessionCreator) Create() (*realtime.Session, error) {
 	return f.store.Create()
 }
 
-func newCreateSessionRouter(creator handlers.SessionCreator) *gin.Engine {
+func newCreateSessionRouter(creator handlers.SessionCreator, repo sessionrepo.Repository) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.POST("/api/v1/sessions", handlers.NewCreateSession(creator))
+	router.POST("/api/v1/sessions", handlers.NewCreateSession(creator, repo))
 	return router
 }
 
 func TestCreateSession_Success(t *testing.T) {
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	router := newCreateSessionRouter(&fakeSessionCreator{store: store})
+	router := newCreateSessionRouter(&fakeSessionCreator{store: store}, newFakeSessionRepository())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", nil)
@@ -60,7 +61,7 @@ func TestCreateSession_Success(t *testing.T) {
 }
 
 func TestCreateSession_StoreError(t *testing.T) {
-	router := newCreateSessionRouter(&fakeSessionCreator{err: errors.New("boom")})
+	router := newCreateSessionRouter(&fakeSessionCreator{err: errors.New("boom")}, newFakeSessionRepository())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", nil)
@@ -72,7 +73,7 @@ func TestCreateSession_StoreError(t *testing.T) {
 }
 
 func TestCreateSession_TooManySessions(t *testing.T) {
-	router := newCreateSessionRouter(&fakeSessionCreator{err: realtime.ErrTooManySessions})
+	router := newCreateSessionRouter(&fakeSessionCreator{err: realtime.ErrTooManySessions}, newFakeSessionRepository())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", nil)
@@ -80,6 +81,25 @@ func TestCreateSession_TooManySessions(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+}
+
+// TestCreateSession_RepositoryError proves a failed persistence write
+// fails the request even though the in-memory session was already
+// created — POST /api/v1/sessions is meant to guarantee a durable
+// record exists by the time it returns 201.
+func TestCreateSession_RepositoryError(t *testing.T) {
+	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
+	repo := newFakeSessionRepository()
+	repo.createErr = errors.New("connection refused")
+	router := newCreateSessionRouter(&fakeSessionCreator{store: store}, repo)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", nil)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
 	}
 }
 

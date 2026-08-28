@@ -14,6 +14,7 @@ services/video-detector/training_cache
 # Environment
 .env
 .env.*
+!.env.example
 
 # IDE
 .idea/

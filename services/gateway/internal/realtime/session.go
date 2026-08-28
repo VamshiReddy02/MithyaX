@@ -383,9 +383,9 @@ func (s *Session) End() OutMessage {
 	return OutMessage{Type: TypeSessionEnded, ID: s.id}
 }
 
-// riskUpdateLocked builds the risk_update message from whichever
-// signals have been gathered so far. Callers must hold s.mu.
-func (s *Session) riskUpdateLocked() OutMessage {
+// signalsLocked builds risk.Signals from whichever scores have been
+// gathered so far. Callers must hold s.mu.
+func (s *Session) signalsLocked() risk.Signals {
 	var sig risk.Signals
 
 	if s.videoScore != nil {
@@ -398,7 +398,24 @@ func (s *Session) riskUpdateLocked() OutMessage {
 		sig.Temporal, sig.TemporalOK = *s.temporalScore, true
 	}
 
-	return riskUpdateMessage(s.riskEngine.AssessSignals(sig))
+	return sig
+}
+
+// riskUpdateLocked builds the risk_update message from whichever
+// signals have been gathered so far. Callers must hold s.mu.
+func (s *Session) riskUpdateLocked() OutMessage {
+	return riskUpdateMessage(s.riskEngine.AssessSignals(s.signalsLocked()))
+}
+
+// FinalAssessment recomputes the risk assessment from whatever signals
+// this session ever gathered. Safe to call after End(): the underlying
+// scores are plain fields set only by worker goroutines, all of which
+// have exited by the time End() returns. Used to persist a session's
+// final risk_score/verdict once it ends (see internal/repository/sessions).
+func (s *Session) FinalAssessment() risk.Assessment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.riskEngine.AssessSignals(s.signalsLocked())
 }
 
 func videoResultMessage(r *detector.FrameResult) OutMessage {

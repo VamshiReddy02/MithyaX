@@ -54,7 +54,7 @@ func TestServer_Routes(t *testing.T) {
 	defer mr.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httpserver.New(config.Config{
+	srv, err := httpserver.New(config.Config{
 		Port:                 "0",
 		Environment:          "test",
 		DetectorBaseURL:      fakeDetector.URL,
@@ -66,6 +66,9 @@ func TestServer_Routes(t *testing.T) {
 		RedisAddr:            mr.Addr(),
 		JobTTL:               time.Hour,
 	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
 	defer srv.Pool.Shutdown(context.Background())
 	defer srv.Redis.Close()
 

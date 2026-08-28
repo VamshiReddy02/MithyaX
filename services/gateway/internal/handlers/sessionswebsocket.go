@@ -1,14 +1,24 @@
 package handlers
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	gorilla "github.com/gorilla/websocket"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
+	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 )
+
+// completePersistTimeout bounds how long persisting a session's final
+// result may take. Deliberately not tied to the HTTP request's own
+// context: by the time ReadPump returns, the WebSocket's underlying
+// connection (and the request it was upgraded from) may already be
+// closed, which would cancel that context before this write ever runs.
+const completePersistTimeout = 5 * time.Second
 
 // SessionStore looks up and removes live analysis sessions.
 // *realtime.Store implements it.
@@ -35,7 +45,7 @@ var sessionUpgrader = gorilla.Upgrader{
 // is WebRTC signaling between browsers in a room (see internal/
 // websocket); this one is a single browser streaming its own analysis
 // session. They solve unrelated problems and shouldn't share a route.
-func NewSessionWebSocket(store SessionStore, logger *slog.Logger) gin.HandlerFunc {
+func NewSessionWebSocket(store SessionStore, repo sessionrepo.Repository, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Query("session_id")
 		if sessionID == "" {
@@ -65,6 +75,21 @@ func NewSessionWebSocket(store SessionStore, logger *slog.Logger) gin.HandlerFun
 			Status: string(session.Status()),
 		})
 		client.ReadPump()
+
+		assessment := session.FinalAssessment()
+		persistCtx, cancel := context.WithTimeout(context.Background(), completePersistTimeout)
+		err = repo.Complete(persistCtx, sessionID, sessionrepo.Result{
+			RiskScore:   assessment.RiskScore,
+			Verdict:     string(assessment.Verdict),
+			CompletedAt: time.Now(),
+		})
+		cancel()
+		if err != nil {
+			logger.Warn("failed to persist final session result",
+				slog.String("session_id", sessionID),
+				slog.String("error", err.Error()),
+			)
+		}
 
 		store.Delete(sessionID)
 	}
