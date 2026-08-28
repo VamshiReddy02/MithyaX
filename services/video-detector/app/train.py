@@ -17,9 +17,14 @@ DATASET_DIR = Path("samples/dataset")
 CACHE_DIR = Path("training_cache")
 CHECKPOINT_OUT = Path("models/finetuned_classifier.pth")
 
-# Fake videos held out entirely from training, used only to measure
-# generalization to videos the model has never seen in any form.
+# Videos held out entirely from training, used only to measure
+# generalization to people/clips the model has never seen in any form.
+# Holding out real videos too (not just fake ones) matters once there's
+# more than one real video to choose from — otherwise "holdout accuracy"
+# only ever tests generalization to unseen fakes, never to an unseen
+# real person.
 HOLDOUT_FAKE_VIDEOS = {"fake_11.mp4", "fake_12.mp4", "fake_13.mp4"}
+HOLDOUT_REAL_VIDEOS = {"real_12.mp4", "real_13.mp4"}
 
 # Every Nth frame is cached, to cut down on near-duplicate adjacent
 # frames and keep extraction/training time manageable.
@@ -87,7 +92,7 @@ def list_samples():
 
             video_name = video_dir.name + ".mp4"
 
-            if video_name in HOLDOUT_FAKE_VIDEOS:
+            if video_name in HOLDOUT_FAKE_VIDEOS or video_name in HOLDOUT_REAL_VIDEOS:
                 for crop in crops:
                     samples.append((crop, label, "val_holdout"))
                 continue
@@ -155,19 +160,23 @@ def main() -> None:
     n_real_train = sum(1 for s in train_samples if s[1] == "real")
     n_fake_train = sum(1 for s in train_samples if s[1] == "fake")
 
+    n_real_videos = sum(1 for d in (CACHE_DIR / "real").iterdir() if d.is_dir())
+    n_fake_videos = sum(1 for d in (CACHE_DIR / "fake").iterdir() if d.is_dir())
+
     print()
     print(f"Train crops:          {len(train_samples)} (real={n_real_train}, fake={n_fake_train})")
     print(f"Val (same video):     {len(val_same_video)}")
     print(f"Val (holdout videos): {len(val_holdout)}")
     print()
     print(
-        "CAUTION: only one REAL video exists in this dataset, so every "
-        "'real' crop comes from the same person/background/lighting. The "
-        "model may learn to recognize that specific video rather than "
-        "general real-vs-fake cues. Val (holdout videos) is the only "
-        "number here that reflects real generalization, and even that is "
-        "only evaluated on FAKE videos since there is no second REAL video "
-        "to hold out."
+        f"Dataset: {n_real_videos} real / {n_fake_videos} fake videos "
+        f"({len(HOLDOUT_REAL_VIDEOS)} real, {len(HOLDOUT_FAKE_VIDEOS)} fake held out). "
+        "Still a small dataset for a 20M-parameter backbone even fine-tuning "
+        "only the head — watch same-video vs. holdout accuracy diverge as a "
+        "sign the model is memorizing specific people/backgrounds rather "
+        "than learning general real-vs-fake cues, and treat the real/fake "
+        "holdout accuracies below as the numbers that matter, not the "
+        "same-video one."
     )
     print()
 
@@ -179,9 +188,14 @@ def main() -> None:
         ]
     )
 
+    val_holdout_real = [s for s in val_holdout if s[1] == "real"]
+    val_holdout_fake = [s for s in val_holdout if s[1] == "fake"]
+
     train_dataset = CropDataset(train_samples, transform)
     val_same_dataset = CropDataset(val_same_video, transform)
     val_holdout_dataset = CropDataset(val_holdout, transform)
+    val_holdout_real_dataset = CropDataset(val_holdout_real, transform)
+    val_holdout_fake_dataset = CropDataset(val_holdout_fake, transform)
 
     # Weighted sampling to counter the real/fake crop imbalance.
     class_counts = {0: n_real_train, 1: n_fake_train}
@@ -199,6 +213,8 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=0)
     val_same_loader = DataLoader(val_same_dataset, batch_size=32, num_workers=0)
     val_holdout_loader = DataLoader(val_holdout_dataset, batch_size=32, num_workers=0) if val_holdout else None
+    val_holdout_real_loader = DataLoader(val_holdout_real_dataset, batch_size=32, num_workers=0) if val_holdout_real else None
+    val_holdout_fake_loader = DataLoader(val_holdout_fake_dataset, batch_size=32, num_workers=0) if val_holdout_fake else None
 
     device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Training on {device}")
@@ -221,7 +237,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.classifier.parameters(), lr=1e-4, weight_decay=1e-4)
     criterion = torch.nn.CrossEntropyLoss()
 
-    best_holdout_acc = -1.0
+    best_balanced_holdout_acc = -1.0
     epochs = 8
 
     for epoch in range(1, epochs + 1):
@@ -243,17 +259,26 @@ def main() -> None:
 
         train_loss = running_loss / len(train_dataset)
         same_video_acc = evaluate(model, val_same_loader, device)
-        holdout_acc = evaluate(model, val_holdout_loader, device) if val_holdout_loader else float("nan")
+        holdout_real_acc = evaluate(model, val_holdout_real_loader, device) if val_holdout_real_loader else float("nan")
+        holdout_fake_acc = evaluate(model, val_holdout_fake_loader, device) if val_holdout_fake_loader else float("nan")
+        # The metric that decides which checkpoint to keep: the worse of
+        # the two holdout accuracies, not a blended average. A blended
+        # number lets a model that's great on fakes and useless on reals
+        # (or vice versa) look good whenever one class outnumbers the
+        # other in the holdout set — exactly the failure mode a "just
+        # predict fake" degenerate model would hide behind.
+        balanced_holdout_acc = min(holdout_real_acc, holdout_fake_acc)
 
         print(
             f"Epoch {epoch}/{epochs}  "
             f"loss={train_loss:.4f}  "
             f"val_same_video_acc={same_video_acc:.4f}  "
-            f"val_holdout_acc={holdout_acc:.4f}"
+            f"holdout_real_acc={holdout_real_acc:.4f}  "
+            f"holdout_fake_acc={holdout_fake_acc:.4f}"
         )
 
-        if val_holdout_loader and holdout_acc >= best_holdout_acc:
-            best_holdout_acc = holdout_acc
+        if val_holdout_real_loader and val_holdout_fake_loader and balanced_holdout_acc >= best_balanced_holdout_acc:
+            best_balanced_holdout_acc = balanced_holdout_acc
 
             CHECKPOINT_OUT.parent.mkdir(exist_ok=True)
 
@@ -263,7 +288,7 @@ def main() -> None:
             )
 
     print()
-    print(f"Best holdout accuracy: {best_holdout_acc:.4f}")
+    print(f"Best balanced holdout accuracy (min of real/fake): {best_balanced_holdout_acc:.4f}")
     print(f"Saved checkpoint: {CHECKPOINT_OUT}")
 
 
