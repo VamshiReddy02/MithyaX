@@ -21,20 +21,21 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
 )
 
-func newSessionWSTestServer(t *testing.T, store *realtime.Store) (server *httptest.Server, baseURL string, repo *fakeSessionRepository) {
+func newSessionWSTestServer(t *testing.T, store *realtime.Store) (server *httptest.Server, baseURL string, repo *fakeSessionRepository, analysisRepo *fakeAnalysisRepository) {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	repo = newFakeSessionRepository()
+	analysisRepo = newFakeAnalysisRepository()
 	router.POST("/api/v1/sessions", handlers.NewCreateSession(store, repo))
-	router.GET("/api/v1/sessions/ws", handlers.NewSessionWebSocket(store, repo, logger))
+	router.GET("/api/v1/sessions/ws", handlers.NewSessionWebSocket(store, repo, analysisRepo, logger))
 
 	server = httptest.NewServer(router)
 	t.Cleanup(server.Close)
 
-	return server, server.URL, repo
+	return server, server.URL, repo, analysisRepo
 }
 
 func createSession(t *testing.T, baseURL string) string {
@@ -89,7 +90,7 @@ func TestSessionWebSocket_FullLifecycle(t *testing.T) {
 	video := &fakeRealtimeVideoAnalyzer{result: &detector.FrameResult{FaceDetected: true, FakeProbability: 0.8, Verdict: "fake"}}
 	aud := &fakeRealtimeAudioAnalyzer{result: &audio.Result{FakeScore: 0.9, Verdict: "fake"}}
 	store := realtime.NewStore(video, aud, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL, repo := newSessionWSTestServer(t, store)
+	_, baseURL, repo, analysisRepo := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)
@@ -166,11 +167,37 @@ func TestSessionWebSocket_FullLifecycle(t *testing.T) {
 	if persisted.Verdict == "" {
 		t.Error("persisted.Verdict is empty, want it set")
 	}
+
+	// 7.2: the per-modality breakdown behind that risk_score/verdict
+	// should have been persisted too — proving *why* the session got the
+	// verdict it did, not just what the verdict was.
+	analysisResult, err := analysisRepo.GetBySessionID(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("analysisRepo.GetBySessionID(%s) error = %v, want the analysis to have been persisted", sessionID, err)
+	}
+	if analysisResult.VideoFakeScore == nil || *analysisResult.VideoFakeScore != 0.8 {
+		t.Errorf("analysisResult.VideoFakeScore = %v, want 0.8", analysisResult.VideoFakeScore)
+	}
+	if analysisResult.VideoVerdict != "fake" {
+		t.Errorf("analysisResult.VideoVerdict = %q, want %q", analysisResult.VideoVerdict, "fake")
+	}
+	if analysisResult.AudioFakeScore == nil || *analysisResult.AudioFakeScore != 0.9 {
+		t.Errorf("analysisResult.AudioFakeScore = %v, want 0.9", analysisResult.AudioFakeScore)
+	}
+	if analysisResult.AudioVerdict != "fake" {
+		t.Errorf("analysisResult.AudioVerdict = %q, want %q", analysisResult.AudioVerdict, "fake")
+	}
+	if analysisResult.RiskScore != *persisted.RiskScore {
+		t.Errorf("analysisResult.RiskScore = %v, want it to match the session record's %v", analysisResult.RiskScore, *persisted.RiskScore)
+	}
+	if analysisResult.RiskVerdict != persisted.Verdict {
+		t.Errorf("analysisResult.RiskVerdict = %q, want it to match the session record's %q", analysisResult.RiskVerdict, persisted.Verdict)
+	}
 }
 
 func TestSessionWebSocket_UnknownSessionID_NotFound(t *testing.T) {
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL, _ := newSessionWSTestServer(t, store)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
 
 	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/api/v1/sessions/ws?session_id=does-not-exist"
 	_, resp, err := gorilla.DefaultDialer.Dial(wsURL, nil)
@@ -188,7 +215,7 @@ func TestSessionWebSocket_UnknownSessionID_NotFound(t *testing.T) {
 
 func TestSessionWebSocket_MissingSessionID_BadRequest(t *testing.T) {
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL, _ := newSessionWSTestServer(t, store)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
 
 	resp, err := http.Get(baseURL + "/api/v1/sessions/ws")
 	if err != nil {
@@ -207,7 +234,7 @@ func TestSessionWebSocket_MissingSessionID_BadRequest(t *testing.T) {
 func TestSessionWebSocket_DetectorError_SendsErrorMessageAndStaysOpen(t *testing.T) {
 	video := &erroringVideoAnalyzer{}
 	store := realtime.NewStore(video, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, realtime.DefaultConfig)
-	_, baseURL, _ := newSessionWSTestServer(t, store)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)
@@ -267,7 +294,7 @@ func TestSessionWebSocket_OverloadedAudioQueue_EmitsOverloadedErrorCode(t *testi
 
 	cfg := realtime.Config{MaxVideoQueue: 5, VideoWorkers: 1, MaxAudioQueue: 1, AudioWorkers: 1, MaxSessions: 10}
 	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, aud, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, cfg)
-	_, baseURL, _ := newSessionWSTestServer(t, store)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
 
 	sessionID := createSession(t, baseURL)
 	conn := dialSession(t, baseURL, sessionID)

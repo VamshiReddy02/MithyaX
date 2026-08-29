@@ -6,6 +6,7 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
 	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
@@ -45,8 +46,28 @@ func (f *fakeRealtimeTemporalAnalyzer) Analyze(frames []temporal.Frame) *tempora
 
 type fakeRealtimeRiskEngine struct{}
 
+// AssessSignals returns a fixed score/verdict (this fake isn't testing
+// the risk engine's own weighting logic — see internal/risk for that)
+// but still passes each present signal through to Assessment.Signals,
+// the same way the real engine does. Tests that check the persisted
+// per-modality breakdown (see analysisResult in
+// TestSessionWebSocket_FullLifecycle) depend on that pass-through
+// actually happening here, not just in production.
 func (f *fakeRealtimeRiskEngine) AssessSignals(sig risk.Signals) risk.Assessment {
-	return risk.Assessment{RiskScore: 0.1, Verdict: risk.VerdictLikelyAuthentic}
+	assessment := risk.Assessment{RiskScore: 0.1, Verdict: risk.VerdictLikelyAuthentic}
+	if sig.VideoOK {
+		video := sig.Video
+		assessment.Signals.Video = &video
+	}
+	if sig.AudioOK {
+		audio := sig.Audio
+		assessment.Signals.Audio = &audio
+	}
+	if sig.TemporalOK {
+		temporal := sig.Temporal
+		assessment.Signals.Temporal = &temporal
+	}
+	return assessment
 }
 
 // fakeSessionRepository is an in-memory sessions.Repository, so
@@ -96,4 +117,33 @@ func (f *fakeSessionRepository) Complete(ctx context.Context, id string, result 
 	s.Verdict = result.Verdict
 	f.sessions[id] = s
 	return nil
+}
+
+// fakeAnalysisRepository is an in-memory analysis.Repository, mirroring
+// fakeSessionRepository above — see internal/repository/analysis for the
+// real implementation and its own tests against a live database.
+type fakeAnalysisRepository struct {
+	mu      sync.Mutex
+	results map[string]analysisrepo.Result
+}
+
+func newFakeAnalysisRepository() *fakeAnalysisRepository {
+	return &fakeAnalysisRepository{results: make(map[string]analysisrepo.Result)}
+}
+
+func (f *fakeAnalysisRepository) Create(ctx context.Context, result analysisrepo.Result) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results[result.SessionID] = result
+	return nil
+}
+
+func (f *fakeAnalysisRepository) GetBySessionID(ctx context.Context, sessionID string) (*analysisrepo.Result, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.results[sessionID]
+	if !ok {
+		return nil, analysisrepo.ErrNotFound
+	}
+	return &r, nil
 }

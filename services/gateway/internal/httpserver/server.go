@@ -18,6 +18,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/middleware"
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
+	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
@@ -64,6 +65,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 	sessionRepo := sessionrepo.NewPostgres(db.Pool)
+	analysisRepo := analysisrepo.NewPostgres(db.Pool)
 	jobQueue := worker.NewQueue(redisClient, cfg.WorkerQueueSize)
 	jobStore := worker.NewStore(redisClient, cfg.JobTTL)
 	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
@@ -91,8 +93,9 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.POST("/analyze-session", handlers.NewAnalyzeSession(sessionService, riskEngine))
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
 	v1.POST("/sessions", handlers.NewCreateSession(liveSessionStore, sessionRepo))
-	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, logger))
+	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 	v1.GET("/sessions/metrics", handlers.NewSessionMetrics(liveSessionStore))
+	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
 
 	return &Server{
 		HTTP: &http.Server{

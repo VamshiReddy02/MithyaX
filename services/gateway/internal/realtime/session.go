@@ -115,7 +115,9 @@ type Session struct {
 	frames []temporal.Frame
 
 	videoScore    *float64
+	videoVerdict  string
 	audioScore    *float64
+	audioVerdict  string
 	temporalScore *float64
 }
 
@@ -284,6 +286,7 @@ func (s *Session) processFrame(jpeg []byte) {
 	if result.FaceDetected {
 		score := result.FakeProbability
 		s.videoScore = &score
+		s.videoVerdict = result.Verdict
 	}
 
 	s.frames = append(s.frames, temporal.Frame{
@@ -340,6 +343,7 @@ func (s *Session) processAudioChunk(filename string, data []byte) {
 	s.mu.Lock()
 	score := result.FakeScore
 	s.audioScore = &score
+	s.audioVerdict = result.Verdict
 
 	messages := []OutMessage{audioResultMessage(result), s.riskUpdateLocked()}
 	s.mu.Unlock()
@@ -407,15 +411,32 @@ func (s *Session) riskUpdateLocked() OutMessage {
 	return riskUpdateMessage(s.riskEngine.AssessSignals(s.signalsLocked()))
 }
 
-// FinalAssessment recomputes the risk assessment from whatever signals
-// this session ever gathered. Safe to call after End(): the underlying
-// scores are plain fields set only by worker goroutines, all of which
-// have exited by the time End() returns. Used to persist a session's
-// final risk_score/verdict once it ends (see internal/repository/sessions).
-func (s *Session) FinalAssessment() risk.Assessment {
+// FinalResult is everything worth persisting once a session ends: the
+// risk Assessment (which already carries the raw video/audio/temporal
+// scores via its Signals field) plus each modality's own verdict string
+// — the label that specific detector call returned, which Assessment's
+// SignalScores doesn't carry since the risk engine only cares about the
+// numeric score, not the modality's own real/fake label.
+type FinalResult struct {
+	Assessment   risk.Assessment
+	VideoVerdict string
+	AudioVerdict string
+}
+
+// FinalResult recomputes the risk assessment from whatever signals this
+// session ever gathered, alongside the last video/audio verdict strings
+// reported to the client. Safe to call after End(): the underlying
+// fields are set only by worker goroutines, all of which have exited by
+// the time End() returns. Used to persist a session's final result once
+// it ends (see internal/repository/sessions, internal/repository/analysis).
+func (s *Session) FinalResult() FinalResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.riskEngine.AssessSignals(s.signalsLocked())
+	return FinalResult{
+		Assessment:   s.riskEngine.AssessSignals(s.signalsLocked()),
+		VideoVerdict: s.videoVerdict,
+		AudioVerdict: s.audioVerdict,
+	}
 }
 
 func videoResultMessage(r *detector.FrameResult) OutMessage {

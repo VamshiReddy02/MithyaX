@@ -10,6 +10,7 @@ import (
 	gorilla "github.com/gorilla/websocket"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
+	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 )
 
@@ -45,7 +46,7 @@ var sessionUpgrader = gorilla.Upgrader{
 // is WebRTC signaling between browsers in a room (see internal/
 // websocket); this one is a single browser streaming its own analysis
 // session. They solve unrelated problems and shouldn't share a route.
-func NewSessionWebSocket(store SessionStore, repo sessionrepo.Repository, logger *slog.Logger) gin.HandlerFunc {
+func NewSessionWebSocket(store SessionStore, repo sessionrepo.Repository, analysisRepo analysisrepo.Repository, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Query("session_id")
 		if sessionID == "" {
@@ -76,16 +77,36 @@ func NewSessionWebSocket(store SessionStore, repo sessionrepo.Repository, logger
 		})
 		client.ReadPump()
 
-		assessment := session.FinalAssessment()
+		final := session.FinalResult()
+		completedAt := time.Now()
+
 		persistCtx, cancel := context.WithTimeout(context.Background(), completePersistTimeout)
-		err = repo.Complete(persistCtx, sessionID, sessionrepo.Result{
-			RiskScore:   assessment.RiskScore,
-			Verdict:     string(assessment.Verdict),
-			CompletedAt: time.Now(),
-		})
-		cancel()
-		if err != nil {
+		defer cancel()
+
+		if err := repo.Complete(persistCtx, sessionID, sessionrepo.Result{
+			RiskScore:   final.Assessment.RiskScore,
+			Verdict:     string(final.Assessment.Verdict),
+			CompletedAt: completedAt,
+		}); err != nil {
 			logger.Warn("failed to persist final session result",
+				slog.String("session_id", sessionID),
+				slog.String("error", err.Error()),
+			)
+		}
+
+		if err := analysisRepo.Create(persistCtx, analysisrepo.Result{
+			SessionID:      sessionID,
+			VideoFakeScore: final.Assessment.Signals.Video,
+			VideoVerdict:   final.VideoVerdict,
+			AudioFakeScore: final.Assessment.Signals.Audio,
+			AudioVerdict:   final.AudioVerdict,
+			TemporalScore:  final.Assessment.Signals.Temporal,
+			RiskScore:      final.Assessment.RiskScore,
+			RiskVerdict:    string(final.Assessment.Verdict),
+			RiskReasons:    final.Assessment.Reasons,
+			CreatedAt:      completedAt,
+		}); err != nil {
+			logger.Warn("failed to persist analysis result",
 				slog.String("session_id", sessionID),
 				slog.String("error", err.Error()),
 			)
