@@ -10,8 +10,10 @@ func TestLoad_Defaults(t *testing.T) {
 	// see TestLoad_MissingDatabaseURL) and so must be set even for a test
 	// that's only checking every other field's default.
 	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
-	// GATEWAY_AUTH_TOKEN has no default either (see TestLoad_MissingAuthToken).
+	// GATEWAY_AUTH_TOKEN/GATEWAY_ADMIN_AUTH_TOKEN have no default either
+	// (see TestLoad_MissingAuthToken/TestLoad_MissingAdminAuthToken).
 	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
+	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "test-admin-token")
 
 	cfg, err := Load()
 	if err != nil {
@@ -81,6 +83,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.AuthToken != "test-token" {
 		t.Errorf("AuthToken = %q, want the value GATEWAY_AUTH_TOKEN was set to", cfg.AuthToken)
 	}
+	if cfg.AdminAuthToken != "test-admin-token" {
+		t.Errorf("AdminAuthToken = %q, want the value GATEWAY_ADMIN_AUTH_TOKEN was set to", cfg.AdminAuthToken)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -105,6 +110,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_VIDEO_WORKERS", "5")
 	t.Setenv("GATEWAY_AUDIO_WORKERS", "4")
 	t.Setenv("GATEWAY_AUTH_TOKEN", "override-token")
+	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "override-admin-token")
 
 	cfg, err := Load()
 	if err != nil {
@@ -173,6 +179,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.AuthToken != "override-token" {
 		t.Errorf("AuthToken = %q, want %q", cfg.AuthToken, "override-token")
+	}
+	if cfg.AdminAuthToken != "override-admin-token" {
+		t.Errorf("AdminAuthToken = %q, want %q", cfg.AdminAuthToken, "override-admin-token")
 	}
 }
 
@@ -305,9 +314,23 @@ func TestLoad_MissingAuthToken(t *testing.T) {
 	}
 }
 
+// TestLoad_MissingAdminAuthToken mirrors TestLoad_MissingAuthToken for
+// GATEWAY_ADMIN_AUTH_TOKEN — also a credential with no default (7.7.2).
+// GATEWAY_AUTH_TOKEN is set here so the error is actually about the
+// missing admin token, not the (checked first) user one.
+func TestLoad_MissingAdminAuthToken(t *testing.T) {
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_ADMIN_AUTH_TOKEN unset: expected error, got nil")
+	}
+}
+
 func TestLoad_InvalidRedisURL(t *testing.T) {
 	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
 	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
+	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "test-admin-token")
 	t.Setenv("GATEWAY_REDIS_URL", "not-a-url")
 
 	if _, err := Load(); err == nil {

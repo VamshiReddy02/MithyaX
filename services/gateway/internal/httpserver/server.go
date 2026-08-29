@@ -149,8 +149,17 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	// can call it without a token (7.7.1).
 	router.GET("/health", handlers.NewHealth(db, redisClient))
 
+	// Authentication (who is this caller) and authorization (what can
+	// they do) stay separate middleware stages (7.7.2): every /api/v1
+	// route requires a valid token via auth.Middleware, which attaches
+	// the matched token's Role to the request; a route can additionally
+	// require auth.RequireRole(auth.RoleAdmin) — see /sessions/metrics
+	// below, the one admin-only route so far.
 	v1 := router.Group("/api/v1")
-	v1.Use(auth.Middleware(cfg.AuthToken))
+	v1.Use(auth.Middleware(map[string]auth.Role{
+		cfg.AuthToken:      auth.RoleUser,
+		cfg.AdminAuthToken: auth.RoleAdmin,
+	}))
 	v1.POST("/analyze", handlers.NewAnalyze(pool))
 	v1.GET("/analyze/:id", handlers.NewJobStatus(jobStore))
 	v1.POST("/analyze-frame", handlers.NewAnalyzeFrame(detectorClient))
@@ -159,7 +168,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
 	v1.POST("/sessions", handlers.NewCreateSession(liveSessionStore, sessionRepo))
 	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
-	v1.GET("/sessions/metrics", handlers.NewSessionMetrics(liveSessionStore))
+	v1.GET("/sessions/metrics", auth.RequireRole(auth.RoleAdmin), handlers.NewSessionMetrics(liveSessionStore))
 	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
 	v1.POST("/analysis", handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, logger))
 	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))

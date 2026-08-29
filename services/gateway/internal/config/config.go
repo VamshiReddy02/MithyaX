@@ -87,13 +87,18 @@ type Config struct {
 	// AUDIO_ANALYSIS jobs from the async Redis queue.
 	AudioWorkers int
 	// AuthToken is the shared bearer token internal/auth's middleware
-	// requires on every protected request (Phase 7.7.1). Required — like
+	// maps to auth.RoleUser (Phase 7.7.1/7.7.2). Required — like
 	// DatabaseURL, it carries a real credential, so Load errors rather
 	// than defaulting to any value (see
 	// deployments/docker/.env.example). A static token is deliberately
 	// the whole mechanism for now; see internal/auth's package doc for
 	// why.
 	AuthToken string
+	// AdminAuthToken is the shared bearer token internal/auth's
+	// middleware maps to auth.RoleAdmin (Phase 7.7.2) — a separate
+	// credential from AuthToken, required the same way and for the same
+	// reason.
+	AdminAuthToken string
 }
 
 const (
@@ -147,6 +152,7 @@ func Load() (Config, error) {
 		VideoWorkers:          defaultVideoWorkers,
 		AudioWorkers:          defaultAudioWorkers,
 		AuthToken:             os.Getenv("GATEWAY_AUTH_TOKEN"),
+		AdminAuthToken:        os.Getenv("GATEWAY_ADMIN_AUTH_TOKEN"),
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -253,6 +259,10 @@ func Load() (Config, error) {
 
 	if cfg.AuthToken == "" {
 		return Config{}, errors.New("GATEWAY_AUTH_TOKEN is required (see deployments/docker/.env.example)")
+	}
+
+	if cfg.AdminAuthToken == "" {
+		return Config{}, errors.New("GATEWAY_ADMIN_AUTH_TOKEN is required (see deployments/docker/.env.example)")
 	}
 
 	return cfg, nil

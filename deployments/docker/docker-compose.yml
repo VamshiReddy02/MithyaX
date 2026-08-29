@@ -54,6 +54,7 @@ services:
       GATEWAY_REDIS_URL: redis://redis:6379
       GATEWAY_DATABASE_URL: postgres://${POSTGRES_USER:?set POSTGRES_USER in deployments/docker/.env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deployments/docker/.env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in deployments/docker/.env}
       GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN:?set GATEWAY_AUTH_TOKEN in deployments/docker/.env}
+      GATEWAY_ADMIN_AUTH_TOKEN: ${GATEWAY_ADMIN_AUTH_TOKEN:?set GATEWAY_ADMIN_AUTH_TOKEN in deployments/docker/.env}
     depends_on:
       video-detector:
         condition: service_healthy

@@ -22,11 +22,15 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/httpserver"
 )
 
-// testAuthToken is the GATEWAY_AUTH_TOKEN this test configures the
-// server with (7.7.1) — every /api/v1/* request below must carry it,
-// since that whole group now requires authentication; /health does
-// not (see its own request below).
-const testAuthToken = "test-server-auth-token"
+// testAuthToken/testAdminAuthToken are the GATEWAY_AUTH_TOKEN/
+// GATEWAY_ADMIN_AUTH_TOKEN this test configures the server with
+// (7.7.1/7.7.2) — every /api/v1/* request below must carry one of
+// them, since that whole group now requires authentication; /health
+// does not (see its own request below).
+const (
+	testAuthToken      = "test-server-auth-token"
+	testAdminAuthToken = "test-server-admin-auth-token"
+)
 
 // doAuthed sends an authenticated request to url — a plain http.Get/
 // http.Post can't set headers, and every /api/v1/* route needs the
@@ -92,6 +96,7 @@ func TestServer_Routes(t *testing.T) {
 		RedisURL:             "redis://" + mr.Addr(),
 		JobTTL:               time.Hour,
 		AuthToken:            testAuthToken,
+		AdminAuthToken:       testAdminAuthToken,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -241,6 +246,7 @@ func TestServer_AuthWiring(t *testing.T) {
 		RedisURL:             "redis://" + mr.Addr(),
 		JobTTL:               time.Hour,
 		AuthToken:            testAuthToken,
+		AdminAuthToken:       testAdminAuthToken,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -299,5 +305,41 @@ func TestServer_AuthWiring(t *testing.T) {
 	defer validAuthResp.Body.Close()
 	if validAuthResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("POST /api/v1/analysis with valid token, empty body status = %d, want %d (validation, not auth, should reject this)", validAuthResp.StatusCode, http.StatusBadRequest)
+	}
+
+	// 7.7.2: GET /sessions/metrics is the one admin-only route so far.
+	// A plain user token is authenticated but not authorized for it —
+	// 403, not 401.
+	userMetricsResp := doAuthed(t, http.MethodGet, ts.URL+"/api/v1/sessions/metrics", "", nil)
+	defer userMetricsResp.Body.Close()
+	if userMetricsResp.StatusCode != http.StatusForbidden {
+		t.Errorf("GET /sessions/metrics with user token status = %d, want %d", userMetricsResp.StatusCode, http.StatusForbidden)
+	}
+
+	// The admin token reaches it.
+	adminMetricsReq, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/sessions/metrics", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	adminMetricsReq.Header.Set("Authorization", "Bearer "+testAdminAuthToken)
+	adminMetricsResp, err := http.DefaultClient.Do(adminMetricsReq)
+	if err != nil {
+		t.Fatalf("GET /sessions/metrics (admin auth): %v", err)
+	}
+	defer adminMetricsResp.Body.Close()
+	if adminMetricsResp.StatusCode != http.StatusOK {
+		t.Errorf("GET /sessions/metrics with admin token status = %d, want %d", adminMetricsResp.StatusCode, http.StatusOK)
+	}
+
+	// No token at all on the admin-only route: still 401, never 403 —
+	// authentication failure and authorization failure must stay
+	// distinguishable even on a route that also has a role requirement.
+	noAuthMetricsResp, err := http.Get(ts.URL + "/api/v1/sessions/metrics")
+	if err != nil {
+		t.Fatalf("GET /sessions/metrics (no auth): %v", err)
+	}
+	defer noAuthMetricsResp.Body.Close()
+	if noAuthMetricsResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /sessions/metrics with no token status = %d, want %d", noAuthMetricsResp.StatusCode, http.StatusUnauthorized)
 	}
 }
