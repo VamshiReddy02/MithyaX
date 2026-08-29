@@ -86,6 +86,14 @@ type Config struct {
 	// AudioWorkers is how many goroutines concurrently consume
 	// AUDIO_ANALYSIS jobs from the async Redis queue.
 	AudioWorkers int
+	// AuthToken is the shared bearer token internal/auth's middleware
+	// requires on every protected request (Phase 7.7.1). Required — like
+	// DatabaseURL, it carries a real credential, so Load errors rather
+	// than defaulting to any value (see
+	// deployments/docker/.env.example). A static token is deliberately
+	// the whole mechanism for now; see internal/auth's package doc for
+	// why.
+	AuthToken string
 }
 
 const (
@@ -138,6 +146,7 @@ func Load() (Config, error) {
 		RealtimeMaxSessions:   defaultRealtimeMaxSessions,
 		VideoWorkers:          defaultVideoWorkers,
 		AudioWorkers:          defaultAudioWorkers,
+		AuthToken:             os.Getenv("GATEWAY_AUTH_TOKEN"),
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -240,6 +249,10 @@ func Load() (Config, error) {
 
 	if _, err := url.ParseRequestURI(cfg.RedisURL); err != nil {
 		return Config{}, fmt.Errorf("invalid GATEWAY_REDIS_URL %q: %w", cfg.RedisURL, err)
+	}
+
+	if cfg.AuthToken == "" {
+		return Config{}, errors.New("GATEWAY_AUTH_TOKEN is required (see deployments/docker/.env.example)")
 	}
 
 	return cfg, nil

@@ -22,6 +22,32 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/httpserver"
 )
 
+// testAuthToken is the GATEWAY_AUTH_TOKEN this test configures the
+// server with (7.7.1) — every /api/v1/* request below must carry it,
+// since that whole group now requires authentication; /health does
+// not (see its own request below).
+const testAuthToken = "test-server-auth-token"
+
+// doAuthed sends an authenticated request to url — a plain http.Get/
+// http.Post can't set headers, and every /api/v1/* route needs the
+// bearer token now that internal/auth's middleware guards the group.
+func doAuthed(t *testing.T, method, url, contentType string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatalf("build request for %s %s: %v", method, url, err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAuthToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
+}
+
 func TestServer_Routes(t *testing.T) {
 	fakeDetector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -65,6 +91,7 @@ func TestServer_Routes(t *testing.T) {
 		WorkerQueueSize:      8,
 		RedisURL:             "redis://" + mr.Addr(),
 		JobTTL:               time.Hour,
+		AuthToken:            testAuthToken,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -105,23 +132,15 @@ func TestServer_Routes(t *testing.T) {
 		t.Errorf(`Checks["redis"] = %q, want "healthy" (a real miniredis is configured for this test)`, health.Checks["redis"])
 	}
 
-	resp2, err := http.Post(ts.URL+"/api/v1/analyze", "application/json", nil)
-	if err != nil {
-		t.Fatalf("POST /api/v1/analyze: %v", err)
-	}
+	resp2 := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analyze", "application/json", nil)
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusBadRequest {
 		t.Errorf("POST /api/v1/analyze with no body status = %d, want %d", resp2.StatusCode, http.StatusBadRequest)
 	}
 
-	resp3, err := http.Post(
-		ts.URL+"/api/v1/analyze",
-		"application/json",
+	resp3 := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analyze", "application/json",
 		strings.NewReader(`{"video_url":"https://example.com/video.mp4"}`),
 	)
-	if err != nil {
-		t.Fatalf("POST /api/v1/analyze: %v", err)
-	}
 	defer resp3.Body.Close()
 	if resp3.StatusCode != http.StatusAccepted {
 		t.Errorf("POST /api/v1/analyze status = %d, want %d", resp3.StatusCode, http.StatusAccepted)
@@ -141,10 +160,7 @@ func TestServer_Routes(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var status handlers.JobStatusResponse
 	for time.Now().Before(deadline) {
-		resp4, err := http.Get(ts.URL + "/api/v1/analyze/" + queued.ID)
-		if err != nil {
-			t.Fatalf("GET /api/v1/analyze/%s: %v", queued.ID, err)
-		}
+		resp4 := doAuthed(t, http.MethodGet, ts.URL+"/api/v1/analyze/"+queued.ID, "", nil)
 		if err := json.NewDecoder(resp4.Body).Decode(&status); err != nil {
 			resp4.Body.Close()
 			t.Fatalf("decode GET /api/v1/analyze/%s response: %v", queued.ID, err)
@@ -164,10 +180,7 @@ func TestServer_Routes(t *testing.T) {
 		t.Errorf("Result = %+v, want Verdict=fake", status.Result)
 	}
 
-	resp5, err := http.Get(ts.URL + "/api/v1/analyze/does-not-exist")
-	if err != nil {
-		t.Fatalf("GET /api/v1/analyze/does-not-exist: %v", err)
-	}
+	resp5 := doAuthed(t, http.MethodGet, ts.URL+"/api/v1/analyze/does-not-exist", "", nil)
 	defer resp5.Body.Close()
 	if resp5.StatusCode != http.StatusNotFound {
 		t.Errorf("GET /api/v1/analyze/does-not-exist status = %d, want %d", resp5.StatusCode, http.StatusNotFound)
@@ -189,10 +202,7 @@ func TestServer_Routes(t *testing.T) {
 		t.Fatalf("audioWriter.Close: %v", err)
 	}
 
-	resp6, err := http.Post(ts.URL+"/api/v1/analyze-audio", audioWriter.FormDataContentType(), audioBody)
-	if err != nil {
-		t.Fatalf("POST /api/v1/analyze-audio: %v", err)
-	}
+	resp6 := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analyze-audio", audioWriter.FormDataContentType(), audioBody)
 	defer resp6.Body.Close()
 	if resp6.StatusCode != http.StatusOK {
 		t.Errorf("POST /api/v1/analyze-audio status = %d, want %d", resp6.StatusCode, http.StatusOK)
@@ -204,5 +214,90 @@ func TestServer_Routes(t *testing.T) {
 	}
 	if audioResult.Verdict != "fake" || audioResult.Chunks != 2 {
 		t.Errorf("audioResult = %+v, want Verdict=fake Chunks=2", audioResult)
+	}
+}
+
+// TestServer_AuthWiring proves 7.7.1's routing decision itself: the
+// entire /api/v1 group requires the configured bearer token, and
+// /health is deliberately exempt so a Kubernetes probe or load
+// balancer can call it without one. internal/auth/middleware_test.go
+// covers the middleware's own logic in isolation; this test is only
+// about which routes server.go actually applied it to.
+func TestServer_AuthWiring(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                 "0",
+		Environment:          "test",
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          1,
+		WorkerQueueSize:      1,
+		RedisURL:             "redis://" + mr.Addr(),
+		JobTTL:               time.Hour,
+		AuthToken:            testAuthToken,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	// /health: no Authorization header at all, must not be rejected for
+	// that reason (it may still report 503 if a dependency is down —
+	// what matters here is it's never 401).
+	healthResp, err := http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer healthResp.Body.Close()
+	if healthResp.StatusCode == http.StatusUnauthorized {
+		t.Error("GET /health returned 401 — /health must stay public")
+	}
+
+	// A protected route with no Authorization header must be rejected
+	// before it ever reaches the handler.
+	noAuthResp, err := http.Post(ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST /api/v1/analysis (no auth): %v", err)
+	}
+	defer noAuthResp.Body.Close()
+	if noAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/analysis with no Authorization header status = %d, want %d", noAuthResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// Same route, wrong token — also rejected, and still before the
+	// handler (a handler-level 400 for the empty body would prove the
+	// middleware let it through, which must not happen).
+	wrongAuthReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/analysis", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	wrongAuthReq.Header.Set("Authorization", "Bearer wrong-token")
+	wrongAuthResp, err := http.DefaultClient.Do(wrongAuthReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/analysis (wrong auth): %v", err)
+	}
+	defer wrongAuthResp.Body.Close()
+	if wrongAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/analysis with wrong token status = %d, want %d", wrongAuthResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// The same route with the correct token reaches the handler — an
+	// empty body now fails validation (400), not authentication (401),
+	// proving the middleware actually let it through.
+	validAuthResp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(`{}`))
+	defer validAuthResp.Body.Close()
+	if validAuthResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /api/v1/analysis with valid token, empty body status = %d, want %d (validation, not auth, should reject this)", validAuthResp.StatusCode, http.StatusBadRequest)
 	}
 }

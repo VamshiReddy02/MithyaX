@@ -10,6 +10,8 @@ func TestLoad_Defaults(t *testing.T) {
 	// see TestLoad_MissingDatabaseURL) and so must be set even for a test
 	// that's only checking every other field's default.
 	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+	// GATEWAY_AUTH_TOKEN has no default either (see TestLoad_MissingAuthToken).
+	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
 
 	cfg, err := Load()
 	if err != nil {
@@ -76,6 +78,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.AudioWorkers != defaultAudioWorkers {
 		t.Errorf("AudioWorkers = %d, want %d", cfg.AudioWorkers, defaultAudioWorkers)
 	}
+	if cfg.AuthToken != "test-token" {
+		t.Errorf("AuthToken = %q, want the value GATEWAY_AUTH_TOKEN was set to", cfg.AuthToken)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -99,6 +104,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("REALTIME_MAX_SESSIONS", "50")
 	t.Setenv("GATEWAY_VIDEO_WORKERS", "5")
 	t.Setenv("GATEWAY_AUDIO_WORKERS", "4")
+	t.Setenv("GATEWAY_AUTH_TOKEN", "override-token")
 
 	cfg, err := Load()
 	if err != nil {
@@ -164,6 +170,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.AudioWorkers != 4 {
 		t.Errorf("AudioWorkers = %d, want %d", cfg.AudioWorkers, 4)
+	}
+	if cfg.AuthToken != "override-token" {
+		t.Errorf("AuthToken = %q, want %q", cfg.AuthToken, "override-token")
 	}
 }
 
@@ -282,8 +291,23 @@ func TestLoad_MissingDatabaseURL(t *testing.T) {
 	}
 }
 
+// TestLoad_MissingAuthToken proves Load() refuses to start with no
+// GATEWAY_AUTH_TOKEN configured — like GATEWAY_DATABASE_URL, it
+// carries a real credential, so there's nothing safe to default it to.
+// GATEWAY_DATABASE_URL is set here specifically so the error this
+// triggers is actually about the missing token, not the also-missing
+// (but unrelated) database URL.
+func TestLoad_MissingAuthToken(t *testing.T) {
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_AUTH_TOKEN unset: expected error, got nil")
+	}
+}
+
 func TestLoad_InvalidRedisURL(t *testing.T) {
 	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
 	t.Setenv("GATEWAY_REDIS_URL", "not-a-url")
 
 	if _, err := Load(); err == nil {

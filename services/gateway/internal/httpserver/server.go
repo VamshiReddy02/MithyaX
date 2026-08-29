@@ -11,6 +11,7 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisworker"
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
+	"github.com/vamshireddy02/mithyax/gateway/internal/auth"
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
 	"github.com/vamshireddy02/mithyax/gateway/internal/database"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
@@ -143,9 +144,13 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 	liveSessionStore := realtime.NewStore(detectorClient, audioClient, temporalAnalyzer, riskEngine, realtimeCfg)
 
+	// /health stays outside auth.Middleware — deliberately public so a
+	// Kubernetes liveness/readiness probe or load balancer health check
+	// can call it without a token (7.7.1).
 	router.GET("/health", handlers.NewHealth(db, redisClient))
 
 	v1 := router.Group("/api/v1")
+	v1.Use(auth.Middleware(cfg.AuthToken))
 	v1.POST("/analyze", handlers.NewAnalyze(pool))
 	v1.GET("/analyze/:id", handlers.NewJobStatus(jobStore))
 	v1.POST("/analyze-frame", handlers.NewAnalyzeFrame(detectorClient))
