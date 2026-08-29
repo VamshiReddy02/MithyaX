@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 )
 
 // Pool runs a fixed number of Workers against one Queue, all sharing
@@ -18,12 +19,13 @@ type Pool struct {
 }
 
 // NewPool builds a Pool of count Workers, all consuming from q via
-// handler. Workers don't start doing anything until Start is called.
-func NewPool(q queue.Queue, handler Handler, count int, logger *slog.Logger, opts ...Option) *Pool {
+// handler and recording status transitions in jobs. Workers don't
+// start doing anything until Start is called.
+func NewPool(q queue.Queue, handler Handler, jobs jobsrepo.Repository, count int, logger *slog.Logger, opts ...Option) *Pool {
 	metrics := NewMetrics()
 	workers := make([]*Worker, count)
 	for i := range workers {
-		workers[i] = NewWorker(q, handler, metrics, logger, opts...)
+		workers[i] = NewWorker(q, handler, jobs, metrics, logger, opts...)
 	}
 	return &Pool{workers: workers, metrics: metrics}
 }

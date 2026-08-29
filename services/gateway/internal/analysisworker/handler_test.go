@@ -13,6 +13,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 )
 
 // fakeVideoAnalyzer stands in for *detector.Client.
@@ -84,7 +85,9 @@ func (f *fakeAnalysisRepo) UpsertVideoResult(ctx context.Context, sessionID stri
 	r.SessionID = sessionID
 	r.VideoFakeScore = &score
 	r.VideoVerdict = verdict
-	r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
+	if compute != nil {
+		r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
+	}
 	f.results[sessionID] = r
 	return nil
 }
@@ -99,6 +102,23 @@ func (f *fakeAnalysisRepo) UpsertAudioResult(ctx context.Context, sessionID stri
 	r.SessionID = sessionID
 	r.AudioFakeScore = &score
 	r.AudioVerdict = verdict
+	if compute != nil {
+		r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
+	}
+	f.results[sessionID] = r
+	return nil
+}
+
+func (f *fakeAnalysisRepo) FinalizeRisk(ctx context.Context, sessionID string, compute analysisrepo.ComputeRisk) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.results[sessionID]
+	if !ok {
+		return analysisrepo.ErrNotFound
+	}
 	r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
 	f.results[sessionID] = r
 	return nil
@@ -111,10 +131,21 @@ func (f *fakeAnalysisRepo) get(sessionID string) (analysisrepo.Result, bool) {
 	return r, ok
 }
 
+// noWaitCoordinator is a Coordinator backed by an empty fakeJobsRepo —
+// GetLatestBySessionAndType always returns ErrNotFound, so
+// ShouldFinalize always says "the other modality was never requested,"
+// i.e. always ready to compute risk immediately. That's the right
+// default for handler-level tests that only exercise a single
+// modality in isolation; tests of the 7.6.6 wait/finalize behavior
+// itself live in coordinator_test.go.
+func noWaitCoordinator() *analysisworker.Coordinator {
+	return analysisworker.NewCoordinator(newFakeJobsRepo())
+}
+
 func TestVideoHandler_Handle_Success(t *testing.T) {
 	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.87, Verdict: "fake"}}
 	repo := newFakeAnalysisRepo()
-	h := analysisworker.NewVideoHandler(det, repo)
+	h := analysisworker.NewVideoHandler(det, repo, noWaitCoordinator())
 
 	job, err := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	if err != nil {
@@ -139,7 +170,7 @@ func TestVideoHandler_Handle_Success(t *testing.T) {
 
 func TestVideoHandler_Handle_DetectorError(t *testing.T) {
 	det := &fakeVideoAnalyzer{err: &detector.Error{Kind: detector.KindUnavailable, Message: "video-detector unreachable"}}
-	h := analysisworker.NewVideoHandler(det, newFakeAnalysisRepo())
+	h := analysisworker.NewVideoHandler(det, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	err := h.Handle(context.Background(), job)
@@ -152,7 +183,7 @@ func TestVideoHandler_Handle_DetectorError(t *testing.T) {
 }
 
 func TestVideoHandler_IsPermanent_InvalidVideo(t *testing.T) {
-	h := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{}, newFakeAnalysisRepo())
+	h := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	err := &detector.Error{Kind: detector.KindInvalidVideo, Message: "unsupported format"}
 	if !h.IsPermanent(err) {
@@ -164,7 +195,7 @@ func TestVideoHandler_Handle_RepositoryError(t *testing.T) {
 	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.5, Verdict: "real"}}
 	repo := newFakeAnalysisRepo()
 	repo.err = errors.New("connection refused")
-	h := analysisworker.NewVideoHandler(det, repo)
+	h := analysisworker.NewVideoHandler(det, repo, noWaitCoordinator())
 
 	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	if err := h.Handle(context.Background(), job); err == nil {
@@ -191,7 +222,7 @@ func TestAudioHandler_Handle_Success(t *testing.T) {
 	fetcher := &fakeAudioFetcher{data: []byte("wav-bytes")}
 	det := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.93, Verdict: "fake"}}
 	repo := newFakeAnalysisRepo()
-	h := analysisworker.NewAudioHandler(fetcher, det, repo)
+	h := analysisworker.NewAudioHandler(fetcher, det, repo, noWaitCoordinator())
 
 	job, err := analysisjob.NewAudioAnalysisJob("session-2", "https://example.com/audio.wav")
 	if err != nil {
@@ -219,7 +250,7 @@ func TestAudioHandler_Handle_Success(t *testing.T) {
 
 func TestAudioHandler_Handle_FetchError(t *testing.T) {
 	fetcher := &fakeAudioFetcher{err: errors.New("404 not found")}
-	h := analysisworker.NewAudioHandler(fetcher, &fakeAudioAnalyzer{}, newFakeAnalysisRepo())
+	h := analysisworker.NewAudioHandler(fetcher, &fakeAudioAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	job, _ := analysisjob.NewAudioAnalysisJob("session-2", "https://example.com/missing.wav")
 	if err := h.Handle(context.Background(), job); err == nil {
@@ -228,11 +259,146 @@ func TestAudioHandler_Handle_FetchError(t *testing.T) {
 }
 
 func TestAudioHandler_IsPermanent_InvalidAudio(t *testing.T) {
-	h := analysisworker.NewAudioHandler(&fakeAudioFetcher{}, &fakeAudioAnalyzer{}, newFakeAnalysisRepo())
+	h := analysisworker.NewAudioHandler(&fakeAudioFetcher{}, &fakeAudioAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	err := &audio.Error{Kind: audio.KindInvalidAudio, Message: "corrupt file"}
 	if !h.IsPermanent(err) {
 		t.Error("IsPermanent(invalid audio error) = false, want true")
+	}
+}
+
+// TestVideoAndAudioHandlers_CombinedRisk_VideoFirst proves 7.6.6/7.6.7
+// end to end at the handler level: video completing first, with audio
+// still outstanding, must record only the video score (no risk yet);
+// once audio completes, the coordinator sees video's job as terminal
+// and the audio handler computes and stores the combined risk.
+func TestVideoAndAudioHandlers_CombinedRisk_VideoFirst(t *testing.T) {
+	jobsRepo := newFakeJobsRepo()
+	coordinator := analysisworker.NewCoordinator(jobsRepo)
+	analysisRepo := newFakeAnalysisRepo()
+
+	videoJob, _ := analysisjob.NewVideoAnalysisJob("session-order", "https://example.com/v.mp4")
+	audioJob, _ := analysisjob.NewAudioAnalysisJob("session-order", "https://example.com/a.wav")
+	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-order", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: videoJob.CreatedAt})
+	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-order", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: audioJob.CreatedAt})
+
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
+	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
+		t.Fatalf("video Handle() error = %v", err)
+	}
+
+	result, _ := analysisRepo.get("session-order")
+	if result.RiskScore != 0 || result.RiskVerdict != "" {
+		t.Errorf("risk computed after video alone = (%v, %q), want zero-value — audio is still outstanding", result.RiskScore, result.RiskVerdict)
+	}
+
+	// Video's own job is now done, from the coordinator's point of view —
+	// mirrors what Worker.process's markCompleted does after a
+	// successful Handle, which this handler-only test bypasses.
+	jobsRepo.MarkCompleted(context.Background(), videoJob.ID)
+
+	audioHandler := analysisworker.NewAudioHandler(&fakeAudioFetcher{data: []byte("wav")}, &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.9, Verdict: "fake"}}, analysisRepo, coordinator)
+	if err := audioHandler.Handle(context.Background(), audioJob); err != nil {
+		t.Fatalf("audio Handle() error = %v", err)
+	}
+
+	result, ok := analysisRepo.get("session-order")
+	if !ok || result.RiskVerdict == "" {
+		t.Fatalf("no risk computed after both modalities completed: %+v", result)
+	}
+	if result.VideoFakeScore == nil || *result.VideoFakeScore != 0.8 || result.AudioFakeScore == nil || *result.AudioFakeScore != 0.9 {
+		t.Errorf("stored scores = video=%v audio=%v, want 0.8 and 0.9", result.VideoFakeScore, result.AudioFakeScore)
+	}
+}
+
+// TestVideoAndAudioHandlers_CombinedRisk_AudioFirst is the mirror of
+// the above with audio completing first — proving the result is
+// genuinely order-independent, not incidentally video-first-only.
+func TestVideoAndAudioHandlers_CombinedRisk_AudioFirst(t *testing.T) {
+	jobsRepo := newFakeJobsRepo()
+	coordinator := analysisworker.NewCoordinator(jobsRepo)
+	analysisRepo := newFakeAnalysisRepo()
+
+	videoJob, _ := analysisjob.NewVideoAnalysisJob("session-order-2", "https://example.com/v.mp4")
+	audioJob, _ := analysisjob.NewAudioAnalysisJob("session-order-2", "https://example.com/a.wav")
+	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-order-2", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: videoJob.CreatedAt})
+	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-order-2", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: audioJob.CreatedAt})
+
+	audioHandler := analysisworker.NewAudioHandler(&fakeAudioFetcher{data: []byte("wav")}, &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.9, Verdict: "fake"}}, analysisRepo, coordinator)
+	if err := audioHandler.Handle(context.Background(), audioJob); err != nil {
+		t.Fatalf("audio Handle() error = %v", err)
+	}
+
+	result, _ := analysisRepo.get("session-order-2")
+	if result.RiskVerdict != "" {
+		t.Errorf("risk computed after audio alone = %q, want empty — video is still outstanding", result.RiskVerdict)
+	}
+
+	// Audio's own job is now done — see the comment in the VideoFirst
+	// test above for why this test does this by hand.
+	jobsRepo.MarkCompleted(context.Background(), audioJob.ID)
+
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
+	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
+		t.Fatalf("video Handle() error = %v", err)
+	}
+
+	result, ok := analysisRepo.get("session-order-2")
+	if !ok || result.RiskVerdict == "" {
+		t.Fatalf("no risk computed after both modalities completed: %+v", result)
+	}
+}
+
+// TestVideoHandler_OnDeadLetter_TriggersFinalizationWhenAudioDone
+// proves 7.6.6's dead-letter wrinkle: a video job giving up permanently
+// must still unblock a session whose audio already finished, or that
+// session would never get a final risk assessment.
+func TestVideoHandler_OnDeadLetter_TriggersFinalizationWhenAudioDone(t *testing.T) {
+	jobsRepo := newFakeJobsRepo()
+	coordinator := analysisworker.NewCoordinator(jobsRepo)
+	analysisRepo := newFakeAnalysisRepo()
+
+	videoJob, _ := analysisjob.NewVideoAnalysisJob("session-deadletter", "https://example.com/v.mp4")
+	audioJob, _ := analysisjob.NewAudioAnalysisJob("session-deadletter", "https://example.com/a.wav")
+	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-deadletter", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusDeadLetter, CreatedAt: videoJob.CreatedAt})
+	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-deadletter", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: audioJob.CreatedAt})
+
+	audioHandler := analysisworker.NewAudioHandler(&fakeAudioFetcher{data: []byte("wav")}, &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.6, Verdict: "suspicious"}}, analysisRepo, coordinator)
+	if err := audioHandler.Handle(context.Background(), audioJob); err != nil {
+		t.Fatalf("audio Handle() error = %v", err)
+	}
+	if result, _ := analysisRepo.get("session-deadletter"); result.RiskVerdict == "" {
+		t.Fatal("expected risk already computed — video's job was already dead-lettered (terminal) before audio ran")
+	}
+}
+
+// TestAudioHandler_OnDeadLetter_FinalizesWhenNoResultYet proves the
+// OnDeadLetter path itself (not just the ordinary Handle path) invokes
+// FinalizeRisk once the sibling is terminal — here video already
+// completed and wrote a score, then audio permanently fails.
+func TestAudioHandler_OnDeadLetter_FinalizesWhenNoResultYet(t *testing.T) {
+	jobsRepo := newFakeJobsRepo()
+	coordinator := analysisworker.NewCoordinator(jobsRepo)
+	analysisRepo := newFakeAnalysisRepo()
+
+	videoJob, _ := analysisjob.NewVideoAnalysisJob("session-audio-dl", "https://example.com/v.mp4")
+	audioJob, _ := analysisjob.NewAudioAnalysisJob("session-audio-dl", "https://example.com/a.wav")
+	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-audio-dl", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusCompleted, CreatedAt: videoJob.CreatedAt})
+	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-audio-dl", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusDeadLetter, CreatedAt: audioJob.CreatedAt})
+
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.3, Verdict: "real"}}, analysisRepo, coordinator)
+	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
+		t.Fatalf("video Handle() error = %v", err)
+	}
+	// At this point audio's job is already dead-lettered, so video's own
+	// Handle should have finalized immediately via shouldComputeRisk.
+	if result, _ := analysisRepo.get("session-audio-dl"); result.RiskVerdict == "" {
+		t.Fatal("expected risk computed once video wrote its score, since audio was already terminal (dead_letter)")
+	}
+
+	audioHandler := analysisworker.NewAudioHandler(&fakeAudioFetcher{}, &fakeAudioAnalyzer{}, analysisRepo, coordinator)
+	if err := audioHandler.OnDeadLetter(context.Background(), audioJob); err != nil {
+		t.Fatalf("OnDeadLetter() error = %v", err)
 	}
 }
 

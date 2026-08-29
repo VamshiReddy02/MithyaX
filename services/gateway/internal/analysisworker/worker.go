@@ -25,6 +25,7 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisjob"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 )
 
 const (
@@ -44,9 +45,17 @@ const (
 // through a Handler: decode → (timeout-bounded) handle → ack, or on
 // failure, retry with backoff or dead-letter. Video and audio workers
 // are both just a Worker with a different Handler — see handler.go.
+//
+// Every transition also updates jobs (7.6.3): Redis is the transport,
+// this is the durable record a client polls via
+// GET /api/v1/analysis/jobs/:id. A status-tracking write failing (say,
+// Postgres hiccups while Redis is fine) is logged but never blocks or
+// fails the actual work — losing a status update is far cheaper than
+// losing or duplicating a job.
 type Worker struct {
 	queue   queue.Queue
 	handler Handler
+	jobs    jobsrepo.Repository
 	timeout time.Duration
 	metrics *Metrics
 	logger  *slog.Logger
@@ -64,11 +73,12 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // NewWorker builds a Worker that will consume from q using handler once
-// Start is called.
-func NewWorker(q queue.Queue, handler Handler, metrics *Metrics, logger *slog.Logger, opts ...Option) *Worker {
+// Start is called, recording status transitions in jobs as it goes.
+func NewWorker(q queue.Queue, handler Handler, jobs jobsrepo.Repository, metrics *Metrics, logger *slog.Logger, opts ...Option) *Worker {
 	w := &Worker{
 		queue:   q,
 		handler: handler,
+		jobs:    jobs,
 		timeout: defaultJobTimeout,
 		metrics: metrics,
 		logger:  logger,
@@ -157,13 +167,18 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) {
 		// Can't even decode the job — there's no Attempt/MaxAttempts to
 		// consult, and retrying identical unparseable bytes can't ever
 		// succeed. Dead-letter immediately, per 7.5.5's "don't retry
-		// errors that are clearly permanent" rule.
+		// errors that are clearly permanent" rule. The outer queue.Job
+		// envelope (unlike the corrupt AnalysisJob payload inside it)
+		// decoded fine, so its ID still lets the durable record reflect
+		// this — just without the session/type detail we can't recover.
 		w.logger.Error("malformed job in queue", slog.String("error", err.Error()))
+		w.markDeadLetter(d.Job.ID, "malformed job: "+err.Error())
 		w.failPermanently(d, "malformed job: "+err.Error())
 		return
 	}
 
 	w.metrics.queueWaitLatency.observe(time.Since(job.CreatedAt))
+	w.markProcessing(job)
 
 	handleCtx, cancel := context.WithTimeout(context.Background(), w.timeout)
 	start := time.Now()
@@ -178,6 +193,7 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) {
 		if err != nil {
 			w.logger.Error("ack failed", slog.String("job_id", job.ID), slog.String("error", err.Error()))
 		}
+		w.markCompleted(job)
 		w.metrics.jobsCompleted.Add(1)
 		return
 	}
@@ -193,11 +209,62 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) {
 	var panicked *handlerPanicError
 	permanent := errors.As(handleErr, &panicked) || w.handler.IsPermanent(handleErr) || !job.HasAttemptsRemaining()
 	if permanent {
+		w.markDeadLetter(job.ID, handleErr.Error())
+		w.notifyDeadLetter(job)
 		w.failPermanently(d, handleErr.Error())
 		return
 	}
 
+	w.markFailed(job, handleErr.Error())
 	w.retry(ctx, d, job, handleErr)
+}
+
+// markProcessing, markCompleted, markFailed, and markDeadLetter update
+// the durable job record (7.6.3), logging rather than failing the job
+// if the write itself fails — see Worker's doc comment.
+func (w *Worker) markProcessing(job analysisjob.AnalysisJob) {
+	ctx, cancel := queueOpContext()
+	defer cancel()
+	if err := w.jobs.MarkProcessing(ctx, job.ID, job.Attempt); err != nil {
+		w.logger.Error("mark job processing failed", slog.String("job_id", job.ID), slog.String("error", err.Error()))
+	}
+}
+
+func (w *Worker) markCompleted(job analysisjob.AnalysisJob) {
+	ctx, cancel := queueOpContext()
+	defer cancel()
+	if err := w.jobs.MarkCompleted(ctx, job.ID); err != nil {
+		w.logger.Error("mark job completed failed", slog.String("job_id", job.ID), slog.String("error", err.Error()))
+	}
+}
+
+func (w *Worker) markFailed(job analysisjob.AnalysisJob, reason string) {
+	ctx, cancel := queueOpContext()
+	defer cancel()
+	if err := w.jobs.MarkFailed(ctx, job.ID, job.Attempt, reason); err != nil {
+		w.logger.Error("mark job failed (retry) failed", slog.String("job_id", job.ID), slog.String("error", err.Error()))
+	}
+}
+
+func (w *Worker) markDeadLetter(jobID, reason string) {
+	ctx, cancel := queueOpContext()
+	defer cancel()
+	if err := w.jobs.MarkDeadLetter(ctx, jobID, reason); err != nil {
+		w.logger.Error("mark job dead-letter failed", slog.String("job_id", jobID), slog.String("error", err.Error()))
+	}
+}
+
+// notifyDeadLetter runs the completion coordinator (7.6.6) for a job
+// that's being permanently given up on — see Handler.OnDeadLetter's
+// doc comment for why a dead-lettered modality still needs to trigger
+// this the same way a successful one does.
+func (w *Worker) notifyDeadLetter(job analysisjob.AnalysisJob) {
+	ctx, cancel := queueOpContext()
+	defer cancel()
+	if err := w.handler.OnDeadLetter(ctx, job); err != nil {
+		w.logger.Error("on-dead-letter completion check failed",
+			slog.String("job_id", job.ID), slog.String("session_id", job.SessionID), slog.String("error", err.Error()))
+	}
 }
 
 // handlerPanicError wraps a recovered panic from Handler.Handle.

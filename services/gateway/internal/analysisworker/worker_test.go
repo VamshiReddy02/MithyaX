@@ -10,6 +10,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisjob"
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisworker"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 )
 
 func waitForNotify(t *testing.T, ch <-chan analysisjob.AnalysisJob, timeout time.Duration) analysisjob.AnalysisJob {
@@ -30,7 +31,7 @@ func TestWorker_EnqueueProcessAck(t *testing.T) {
 	q := newTestQueue(t, "test:video")
 	handler := newFakeHandler()
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	job := newTestVideoJob(t, "session-1")
 	enqueueJob(t, q, job)
@@ -78,7 +79,7 @@ func TestWorker_HandlerPanic_DoesNotCrashWorker(t *testing.T) {
 		return nil
 	}
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	enqueueJob(t, q, newTestVideoJob(t, "session-panic"))
 	enqueueJob(t, q, newTestVideoJob(t, "session-after-panic"))
@@ -127,7 +128,7 @@ func TestWorker_HandlerTimeout(t *testing.T) {
 		return nil // second attempt (the retry) succeeds quickly
 	}
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger(), analysisworker.WithTimeout(100*time.Millisecond))
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger(), analysisworker.WithTimeout(100*time.Millisecond))
 
 	enqueueJob(t, q, newTestVideoJob(t, "session-timeout"))
 
@@ -162,7 +163,7 @@ func TestWorker_PermanentError_DeadLettersImmediately(t *testing.T) {
 	handler.handleFunc = func(ctx context.Context, job analysisjob.AnalysisJob) error { return wantErr }
 	handler.permanentFunc = func(err error) bool { return errors.Is(err, wantErr) }
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	enqueueJob(t, q, newTestVideoJob(t, "session-permanent"))
 
@@ -215,7 +216,7 @@ func TestWorker_TransientError_RetriesThenSucceeds(t *testing.T) {
 		return nil
 	}
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	enqueueJob(t, q, newTestVideoJob(t, "session-retry"))
 
@@ -261,7 +262,7 @@ func TestWorker_MaxAttemptsExceeded_DeadLetters(t *testing.T) {
 		return errors.New("still unreachable")
 	}
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	job := newTestVideoJob(t, "session-exhausted")
 	job.MaxAttempts = 2 // keep this test's wall-clock time bounded
@@ -307,7 +308,7 @@ func TestWorker_MalformedJob_DeadLettersWithoutCrashing(t *testing.T) {
 
 	handler := newFakeHandler()
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	w.Start(ctx)
@@ -346,7 +347,7 @@ func TestWorker_DuplicateExecution_HandlerInvokedForBothDeliveries(t *testing.T)
 	q := newTestQueue(t, "test:video")
 	handler := newFakeHandler()
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	job := newTestVideoJob(t, "session-dup")
 	enqueueJob(t, q, job)
@@ -387,7 +388,7 @@ func TestWorker_GracefulShutdown(t *testing.T) {
 		return nil
 	}
 	metrics := analysisworker.NewMetrics()
-	w := analysisworker.NewWorker(q, handler, metrics, testLogger())
+	w := analysisworker.NewWorker(q, handler, newFakeJobsRepo(), metrics, testLogger())
 
 	enqueueJob(t, q, newTestVideoJob(t, "session-inflight"))
 	enqueueJob(t, q, newTestVideoJob(t, "session-never-started"))
@@ -433,4 +434,110 @@ func TestWorker_GracefulShutdown(t *testing.T) {
 
 func mustMalformedJob() queue.Job {
 	return queue.Job{ID: "malformed", Type: "VIDEO_ANALYSIS", Payload: []byte("not valid json")}
+}
+
+// TestWorker_Success_MarksJobCompleted proves 7.6.3's status tracking:
+// a successful job is reflected as completed in the durable jobs
+// record, not just acked off the queue.
+func TestWorker_Success_MarksJobCompleted(t *testing.T) {
+	q := newTestQueue(t, "test:video")
+	handler := newFakeHandler()
+	jobs := newFakeJobsRepo()
+	w := analysisworker.NewWorker(q, handler, jobs, analysisworker.NewMetrics(), testLogger())
+
+	job := newTestVideoJob(t, "session-status")
+	jobs.put(jobsrepo.Job{ID: job.ID, SessionID: job.SessionID, Type: string(job.Type), Status: jobsrepo.StatusQueued, CreatedAt: job.CreatedAt, MaxAttempts: job.MaxAttempts})
+	enqueueJob(t, q, job)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+	defer w.Stop()
+	defer cancel()
+
+	waitForNotify(t, handler.notify, 2*time.Second)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got, err := jobs.Get(context.Background(), job.ID); err == nil && got.Status == jobsrepo.StatusCompleted {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := jobs.Get(context.Background(), job.ID)
+	t.Fatalf("job status = %+v, want status=completed", got)
+}
+
+// TestWorker_PermanentFailure_MarksJobDeadLetterAndNotifiesHandler
+// proves both halves of 7.6.3/7.6.6 on the dead-letter path: the
+// durable record is updated to dead_letter, and the handler's
+// OnDeadLetter hook (the completion coordinator's entry point for a
+// permanently-failed modality) is actually invoked.
+func TestWorker_PermanentFailure_MarksJobDeadLetterAndNotifiesHandler(t *testing.T) {
+	q := newTestQueue(t, "test:video")
+	wantErr := errors.New("malformed input")
+	handler := newFakeHandler()
+	handler.handleFunc = func(ctx context.Context, job analysisjob.AnalysisJob) error { return wantErr }
+	handler.permanentFunc = func(err error) bool { return errors.Is(err, wantErr) }
+	jobs := newFakeJobsRepo()
+	w := analysisworker.NewWorker(q, handler, jobs, analysisworker.NewMetrics(), testLogger())
+
+	job := newTestVideoJob(t, "session-permanent-status")
+	jobs.put(jobsrepo.Job{ID: job.ID, SessionID: job.SessionID, Type: string(job.Type), Status: jobsrepo.StatusQueued, CreatedAt: job.CreatedAt, MaxAttempts: job.MaxAttempts})
+	enqueueJob(t, q, job)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+	defer w.Stop()
+	defer cancel()
+
+	waitForNotify(t, handler.notify, 2*time.Second)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if handler.deadLetterCount() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if handler.deadLetterCount() != 1 {
+		t.Fatal("handler.OnDeadLetter was never called")
+	}
+
+	got, err := jobs.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("jobs.Get() error = %v", err)
+	}
+	if got.Status != jobsrepo.StatusDeadLetter {
+		t.Errorf("job status = %q, want dead_letter", got.Status)
+	}
+}
+
+// TestWorker_MalformedJob_MarksDeadLetterByEnvelopeID proves the
+// malformed-job path still updates the durable record — using the
+// outer queue.Job's ID, since the corrupt AnalysisJob payload can't be
+// decoded at all.
+func TestWorker_MalformedJob_MarksDeadLetterByEnvelopeID(t *testing.T) {
+	q := newTestQueue(t, "test:video")
+	if err := q.Enqueue(context.Background(), mustMalformedJob()); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+
+	jobs := newFakeJobsRepo()
+	jobs.put(jobsrepo.Job{ID: "malformed", SessionID: "unknown", Type: "VIDEO_ANALYSIS", Status: jobsrepo.StatusQueued, CreatedAt: time.Now()})
+	w := analysisworker.NewWorker(q, newFakeHandler(), jobs, analysisworker.NewMetrics(), testLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Start(ctx)
+	defer w.Stop()
+	defer cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got, err := jobs.Get(context.Background(), "malformed"); err == nil && got.Status == jobsrepo.StatusDeadLetter {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := jobs.Get(context.Background(), "malformed")
+	t.Fatalf("job status = %+v, want status=dead_letter", got)
 }

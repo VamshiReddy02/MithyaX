@@ -31,6 +31,15 @@ type Handler interface {
 	// on Handler rather than in Worker so Worker never needs to import
 	// detector/audio to inspect their Error Kinds itself.
 	IsPermanent(err error) bool
+	// OnDeadLetter is called once a job is permanently given up on
+	// (7.5.6) rather than retried. VideoHandler/AudioHandler use it to
+	// still run the completion coordinator (7.6.6): without this, a
+	// session whose audio job dead-letters while video already
+	// succeeded (or vice versa) would wait forever for a risk
+	// assessment that nothing will ever trigger, since only a
+	// *successful* Handle normally does. Errors are logged, not
+	// retried — dead-lettering itself already happened.
+	OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error
 }
 
 // defaultRiskEngine computes the combined risk assessment stored
@@ -40,9 +49,9 @@ type Handler interface {
 var defaultRiskEngine = risk.NewEngine()
 
 // combineRisk adapts defaultRiskEngine to analysisrepo.ComputeRisk, so
-// UpsertVideoResult/UpsertAudioResult can recompute the combined
-// assessment without internal/repository/analysis needing to import
-// internal/risk itself.
+// UpsertVideoResult/UpsertAudioResult/FinalizeRisk can recompute the
+// combined assessment without internal/repository/analysis needing to
+// import internal/risk itself.
 func combineRisk(videoScore, audioScore, temporalScore *float64) (float64, string, []string) {
 	var sig risk.Signals
 	if videoScore != nil {
@@ -58,6 +67,45 @@ func combineRisk(videoScore, audioScore, temporalScore *float64) (float64, strin
 	return assessment.RiskScore, string(assessment.Verdict), assessment.Reasons
 }
 
+// finalizeIfReady asks coordinator whether the modality that just
+// finished (successfully or via dead-letter) for sessionID should
+// trigger the combined risk calculation, and if so, does it —
+// UpsertVideoResult/UpsertAudioResult with combineRisk when there's a
+// fresh score to record alongside it, FinalizeRisk (no score to add)
+// when called from OnDeadLetter. Shared by both handlers since the
+// decision logic is identical either way.
+func shouldComputeRisk(ctx context.Context, coordinator *Coordinator, sessionID string, modality analysisjob.Type) (analysisrepo.ComputeRisk, error) {
+	ready, err := coordinator.ShouldFinalize(ctx, sessionID, modality)
+	if err != nil {
+		return nil, err
+	}
+	if !ready {
+		return nil, nil // the other modality is still outstanding — record the score, not the risk
+	}
+	return combineRisk, nil
+}
+
+// finalizeOnDeadLetter runs the same coordinator check for a
+// permanently-failed job (which never got to upsert a score of its
+// own) and, if the other modality is already terminal, computes risk
+// from whatever's on record. ErrNotFound (no analysis row exists at
+// all — the other modality was never requested and this one never
+// succeeded either) means there's genuinely nothing to finalize, not a
+// failure.
+func finalizeOnDeadLetter(ctx context.Context, coordinator *Coordinator, repo analysisrepo.Repository, sessionID string, modality analysisjob.Type) error {
+	ready, err := coordinator.ShouldFinalize(ctx, sessionID, modality)
+	if err != nil {
+		return fmt.Errorf("check completion coordinator: %w", err)
+	}
+	if !ready {
+		return nil
+	}
+	if err := repo.FinalizeRisk(ctx, sessionID, combineRisk); err != nil && !errors.Is(err, analysisrepo.ErrNotFound) {
+		return fmt.Errorf("finalize risk: %w", err)
+	}
+	return nil
+}
+
 // VideoAnalyzer analyzes a video by URL. *detector.Client implements it
 // via Analyze — the existing client, reused as-is (see package doc).
 type VideoAnalyzer interface {
@@ -69,14 +117,15 @@ type VideoAnalyzer interface {
 // URL, not bytes — nothing to download here), so this only calls it
 // and upserts the result.
 type VideoHandler struct {
-	detector VideoAnalyzer
-	repo     analysisrepo.Repository
+	detector    VideoAnalyzer
+	repo        analysisrepo.Repository
+	coordinator *Coordinator
 }
 
 // NewVideoHandler builds a VideoHandler backed by detectorClient (the
-// existing internal/detector.Client) and repo.
-func NewVideoHandler(detectorClient VideoAnalyzer, repo analysisrepo.Repository) *VideoHandler {
-	return &VideoHandler{detector: detectorClient, repo: repo}
+// existing internal/detector.Client), repo, and coordinator (7.6.6).
+func NewVideoHandler(detectorClient VideoAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *VideoHandler {
+	return &VideoHandler{detector: detectorClient, repo: repo, coordinator: coordinator}
 }
 
 func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) error {
@@ -90,7 +139,12 @@ func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 		return fmt.Errorf("video-detector: %w", err)
 	}
 
-	if err := h.repo.UpsertVideoResult(ctx, job.SessionID, result.FakeScore, result.Verdict, combineRisk); err != nil {
+	compute, err := shouldComputeRisk(ctx, h.coordinator, job.SessionID, analysisjob.TypeVideoAnalysis)
+	if err != nil {
+		return fmt.Errorf("check completion coordinator: %w", err)
+	}
+
+	if err := h.repo.UpsertVideoResult(ctx, job.SessionID, result.FakeScore, result.Verdict, compute); err != nil {
 		return fmt.Errorf("persist video result: %w", err)
 	}
 	return nil
@@ -99,6 +153,10 @@ func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 func (h *VideoHandler) IsPermanent(err error) bool {
 	var detErr *detector.Error
 	return errors.As(err, &detErr) && detErr.Kind == detector.KindInvalidVideo
+}
+
+func (h *VideoHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error {
+	return finalizeOnDeadLetter(ctx, h.coordinator, h.repo, job.SessionID, analysisjob.TypeVideoAnalysis)
 }
 
 // AudioFetcher fetches the bytes referenced by an AUDIO_ANALYSIS job's
@@ -166,15 +224,16 @@ type AudioAnalyzer interface {
 // the referenced audio, hand the bytes to the existing audio-detector
 // client, upsert the result.
 type AudioHandler struct {
-	fetcher  AudioFetcher
-	detector AudioAnalyzer
-	repo     analysisrepo.Repository
+	fetcher     AudioFetcher
+	detector    AudioAnalyzer
+	repo        analysisrepo.Repository
+	coordinator *Coordinator
 }
 
 // NewAudioHandler builds an AudioHandler backed by fetcher, detectorClient
-// (the existing internal/audio.Client), and repo.
-func NewAudioHandler(fetcher AudioFetcher, detectorClient AudioAnalyzer, repo analysisrepo.Repository) *AudioHandler {
-	return &AudioHandler{fetcher: fetcher, detector: detectorClient, repo: repo}
+// (the existing internal/audio.Client), repo, and coordinator (7.6.6).
+func NewAudioHandler(fetcher AudioFetcher, detectorClient AudioAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *AudioHandler {
+	return &AudioHandler{fetcher: fetcher, detector: detectorClient, repo: repo, coordinator: coordinator}
 }
 
 func (h *AudioHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) error {
@@ -193,7 +252,12 @@ func (h *AudioHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 		return fmt.Errorf("audio-detector: %w", err)
 	}
 
-	if err := h.repo.UpsertAudioResult(ctx, job.SessionID, result.FakeScore, result.Verdict, combineRisk); err != nil {
+	compute, err := shouldComputeRisk(ctx, h.coordinator, job.SessionID, analysisjob.TypeAudioAnalysis)
+	if err != nil {
+		return fmt.Errorf("check completion coordinator: %w", err)
+	}
+
+	if err := h.repo.UpsertAudioResult(ctx, job.SessionID, result.FakeScore, result.Verdict, compute); err != nil {
 		return fmt.Errorf("persist audio result: %w", err)
 	}
 	return nil
@@ -202,4 +266,8 @@ func (h *AudioHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 func (h *AudioHandler) IsPermanent(err error) bool {
 	var audErr *audio.Error
 	return errors.As(err, &audErr) && audErr.Kind == audio.KindInvalidAudio
+}
+
+func (h *AudioHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error {
+	return finalizeOnDeadLetter(ctx, h.coordinator, h.repo, job.SessionID, analysisjob.TypeAudioAnalysis)
 }

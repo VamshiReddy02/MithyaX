@@ -277,3 +277,73 @@ func TestPostgres_ConcurrentUpserts_DoNotRace(t *testing.T) {
 		t.Errorf("RiskScore = %v, want %v — whichever upsert finished last must have seen the other's committed write", got.RiskScore, wantRisk)
 	}
 }
+
+// TestPostgres_UpsertVideoResult_NilCompute_SkipsRisk is 7.6.6's core
+// mechanism: a completion coordinator that knows the other modality is
+// still outstanding passes a nil ComputeRisk, and the score is recorded
+// without publishing a premature partial risk.
+func TestPostgres_UpsertVideoResult_NilCompute_SkipsRisk(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	if err := analyses.UpsertVideoResult(ctx, sessionID, 0.9, "fake", nil); err != nil {
+		t.Fatalf("UpsertVideoResult(nil compute) error = %v", err)
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.VideoFakeScore == nil || *got.VideoFakeScore != 0.9 {
+		t.Errorf("VideoFakeScore = %v, want 0.9 — the score itself is still recorded", got.VideoFakeScore)
+	}
+	if got.RiskScore != 0 || got.RiskVerdict != "UNKNOWN" {
+		t.Errorf("risk = (%v, %q), want the placeholder (0, UNKNOWN) — audio is still outstanding, nothing should have published a risk yet", got.RiskScore, got.RiskVerdict)
+	}
+}
+
+// TestPostgres_FinalizeRisk_AfterDeadLetter proves the other half of
+// 7.6.6: once a modality's job is dead-lettered rather than completed
+// (see internal/analysisworker's OnDeadLetter), FinalizeRisk computes a
+// final assessment from whatever did complete, rather than the session
+// waiting forever for a result that's never coming.
+func TestPostgres_FinalizeRisk_AfterDeadLetter(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	// Video completes but, per the coordinator, waits for audio.
+	if err := analyses.UpsertVideoResult(ctx, sessionID, 0.85, "fake", nil); err != nil {
+		t.Fatalf("UpsertVideoResult(nil compute) error = %v", err)
+	}
+
+	// Audio's job is dead-lettered instead of completing — finalize
+	// using whatever's on record (video alone).
+	if err := analyses.FinalizeRisk(ctx, sessionID, meanCompute); err != nil {
+		t.Fatalf("FinalizeRisk() error = %v", err)
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.AudioFakeScore != nil {
+		t.Errorf("AudioFakeScore = %v, want nil — audio never completed", got.AudioFakeScore)
+	}
+	if got.RiskScore != 0.85 {
+		t.Errorf("RiskScore = %v, want 0.85 (video alone, since audio dead-lettered)", got.RiskScore)
+	}
+	if got.RiskVerdict != "LIKELY_FAKE" {
+		t.Errorf("RiskVerdict = %q, want %q", got.RiskVerdict, "LIKELY_FAKE")
+	}
+}
+
+func TestPostgres_FinalizeRisk_NotFound(t *testing.T) {
+	analyses, _ := newTestRepositories(t)
+
+	err := analyses.FinalizeRisk(context.Background(), "does-not-exist", meanCompute)
+	if !errors.Is(err, analysisrepo.ErrNotFound) {
+		t.Errorf("FinalizeRisk() error = %v, want ErrNotFound", err)
+	}
+}

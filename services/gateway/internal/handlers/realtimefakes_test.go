@@ -168,6 +168,20 @@ func (f *fakeAnalysisRepository) upsert(sessionID string, apply func(*analysisre
 	r := f.results[sessionID]
 	r.SessionID = sessionID
 	apply(&r)
+	if compute != nil {
+		r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
+	}
+	f.results[sessionID] = r
+	return nil
+}
+
+func (f *fakeAnalysisRepository) FinalizeRisk(ctx context.Context, sessionID string, compute analysisrepo.ComputeRisk) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.results[sessionID]
+	if !ok {
+		return analysisrepo.ErrNotFound
+	}
 	r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
 	f.results[sessionID] = r
 	return nil

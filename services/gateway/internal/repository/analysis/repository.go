@@ -50,6 +50,11 @@ type Result struct {
 // (see internal/analysisworker) rather than this package importing
 // internal/risk directly, so the actual weighting/threshold logic for
 // combining signals stays out of the persistence layer.
+//
+// May be nil when passed to UpsertVideoResult/UpsertAudioResult: a
+// completion coordinator (7.6.6) can decide the other modality is
+// still outstanding and the score should be recorded without
+// calculating a (premature) risk yet — see those methods' doc comments.
 type ComputeRisk func(videoScore, audioScore, temporalScore *float64) (riskScore float64, riskVerdict string, riskReasons []string)
 
 // Repository persists analysis results. *Postgres is the only
@@ -85,4 +90,13 @@ type Repository interface {
 	UpsertVideoResult(ctx context.Context, sessionID string, videoScore float64, videoVerdict string, compute ComputeRisk) error
 	// UpsertAudioResult is UpsertVideoResult's audio counterpart.
 	UpsertAudioResult(ctx context.Context, sessionID string, audioScore float64, audioVerdict string, compute ComputeRisk) error
+	// FinalizeRisk recomputes and stores the combined risk from
+	// whatever's already on record for sessionID, without changing any
+	// of the underlying signals. Used when a modality's job is
+	// dead-lettered rather than completed (see
+	// internal/analysisworker's OnDeadLetter): nothing else will ever
+	// call compute for that modality again, so without this the session
+	// would wait forever for a result that's never coming. Returns
+	// ErrNotFound if no analysis row exists yet for sessionID.
+	FinalizeRisk(ctx context.Context, sessionID string, compute ComputeRisk) error
 }

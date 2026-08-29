@@ -20,6 +20,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
 	ourredis "github.com/vamshireddy02/mithyax/gateway/internal/redis"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
@@ -92,6 +93,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 	sessionRepo := sessionrepo.NewPostgres(db.Pool)
 	analysisRepo := analysisrepo.NewPostgres(db.Pool)
+	jobsRepo := jobsrepo.NewPostgres(db.Pool)
 	jobQueue := worker.NewQueue(redisClient.Client, cfg.WorkerQueueSize)
 	jobStore := worker.NewStore(redisClient.Client, cfg.JobTTL)
 	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
@@ -99,10 +101,8 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 
 	// Phase 7.5's async analysis worker pools — separate queues, keys,
 	// and Handlers for video vs. audio, per the "Video Queue → Worker
-	// 1/2/3, Audio Queue → Worker 1/2" architecture. Not yet fed by any
-	// HTTP route (nothing enqueues an AnalysisJob today); they run ready
-	// and idle until a future producer exists, the same way this phase
-	// was scoped.
+	// 1/2/3, Audio Queue → Worker 1/2" architecture. Fed by
+	// POST /api/v1/analysis (7.6.1), below.
 	videoQueue := queue.NewRedis(redisClient.Client, "mithyax:jobs:video_analysis", asyncQueueCapacity)
 	audioQueue := queue.NewRedis(redisClient.Client, "mithyax:jobs:audio_analysis", asyncQueueCapacity)
 
@@ -121,10 +121,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		logger.Info("recovered stale audio jobs from a previous run", slog.Int("count", n))
 	}
 
-	videoHandler := analysisworker.NewVideoHandler(detectorClient, analysisRepo)
-	audioHandler := analysisworker.NewAudioHandler(analysisworker.NewHTTPAudioFetcher(), audioClient, analysisRepo)
-	videoWorkers := analysisworker.NewPool(videoQueue, videoHandler, cfg.VideoWorkers, logger)
-	audioWorkers := analysisworker.NewPool(audioQueue, audioHandler, cfg.AudioWorkers, logger)
+	completionCoordinator := analysisworker.NewCoordinator(jobsRepo)
+	videoHandler := analysisworker.NewVideoHandler(detectorClient, analysisRepo, completionCoordinator)
+	audioHandler := analysisworker.NewAudioHandler(analysisworker.NewHTTPAudioFetcher(), audioClient, analysisRepo, completionCoordinator)
+	videoWorkers := analysisworker.NewPool(videoQueue, videoHandler, jobsRepo, cfg.VideoWorkers, logger)
+	audioWorkers := analysisworker.NewPool(audioQueue, audioHandler, jobsRepo, cfg.AudioWorkers, logger)
 
 	workersCtx, stopWorkers := context.WithCancel(context.Background())
 	videoWorkers.Start(workersCtx)
@@ -155,6 +156,8 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 	v1.GET("/sessions/metrics", handlers.NewSessionMetrics(liveSessionStore))
 	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
+	v1.POST("/analysis", handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, logger))
+	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))
 
 	return &Server{
 		HTTP: &http.Server{

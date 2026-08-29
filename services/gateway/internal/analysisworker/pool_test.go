@@ -34,6 +34,8 @@ func (h *trackingHandler) Handle(ctx context.Context, job analysisjob.AnalysisJo
 
 func (h *trackingHandler) IsPermanent(err error) bool { return false }
 
+func (h *trackingHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error { return nil }
+
 func (h *trackingHandler) count() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -59,7 +61,7 @@ func (h *trackingHandler) duplicates() []string {
 func TestPool_MultipleWorkers_ConcurrentJobs(t *testing.T) {
 	q := newTestQueue(t, "test:video")
 	handler := newTrackingHandler()
-	pool := analysisworker.NewPool(q, handler, 5, testLogger())
+	pool := analysisworker.NewPool(q, handler, newFakeJobsRepo(), 5, testLogger())
 
 	const numJobs = 40
 	for i := 0; i < numJobs; i++ {
@@ -104,7 +106,7 @@ func TestPool_GracefulShutdown_SIGTERM(t *testing.T) {
 		<-release
 		return nil
 	}
-	pool := analysisworker.NewPool(q, handler, 3, testLogger())
+	pool := analysisworker.NewPool(q, handler, newFakeJobsRepo(), 3, testLogger())
 
 	for i := 0; i < 3; i++ {
 		enqueueJob(t, q, newTestVideoJob(t, fmt.Sprintf("session-%d", i)))
@@ -162,7 +164,7 @@ func TestPool_QueueRecovery(t *testing.T) {
 	}
 
 	handler := newFakeHandler()
-	pool := analysisworker.NewPool(q, handler, 2, testLogger())
+	pool := analysisworker.NewPool(q, handler, newFakeJobsRepo(), 2, testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	pool.Start(ctx)
 	defer func() { cancel(); pool.Stop() }()

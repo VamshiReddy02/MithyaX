@@ -92,9 +92,16 @@ func (p *Postgres) UpsertAudioResult(ctx context.Context, sessionID string, audi
 
 // upsertModality writes one modality's score/verdict into scoreColumn/
 // verdictColumn (always "video_fake_score"/"video_verdict" or their
-// audio equivalents — never user input, safe to interpolate) and
-// recomputes the combined risk from the row's resulting state, all in
-// one transaction.
+// audio equivalents — never user input, safe to interpolate) and, if
+// compute is non-nil, recomputes the combined risk from the row's
+// resulting state — all in one transaction.
+//
+// compute is nil when a completion coordinator (see
+// internal/analysisworker) has decided the other modality is still
+// outstanding (7.6.6): the score is recorded so it's there once the
+// other modality does complete, but no risk is calculated yet — a
+// video-only partial risk would just have to be silently overwritten
+// once audio arrives, which is worse than not publishing one yet.
 //
 // The row-level lock the UPDATE takes is what makes this safe against
 // a concurrent UpsertVideoResult/UpsertAudioResult pair for the same
@@ -133,19 +140,67 @@ func (p *Postgres) upsertModality(ctx context.Context, sessionID, scoreColumn, v
 		return fmt.Errorf("update %s for session %s: %w", scoreColumn, sessionID, err)
 	}
 
-	riskScore, riskVerdict, riskReasons := compute(videoScore, audioScore, temporalScore)
+	if compute != nil {
+		riskScore, riskVerdict, riskReasons := compute(videoScore, audioScore, temporalScore)
+		if err := writeRisk(ctx, tx, sessionID, riskScore, riskVerdict, riskReasons); err != nil {
+			return err
+		}
+	}
 
-	_, err = tx.Exec(ctx, `
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit analysis upsert for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// FinalizeRisk recomputes and stores the combined risk from whatever
+// video/audio/temporal is already on record for sessionID, without
+// changing any of those signals themselves. Used when a modality's job
+// is dead-lettered (permanently failed) rather than completed: the
+// session would otherwise wait forever for a result that's never
+// coming, since nothing else calls compute for it (see
+// internal/analysisworker's OnDeadLetter). Returns ErrNotFound if no
+// analysis row exists yet for sessionID — nothing to finalize.
+func (p *Postgres) FinalizeRisk(ctx context.Context, sessionID string, compute ComputeRisk) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction for session %s: %w", sessionID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	var videoScore, audioScore, temporalScore *float64
+	err = tx.QueryRow(ctx, `
+		SELECT video_fake_score, audio_fake_score, temporal_score
+		FROM analysis_results
+		WHERE session_id = $1
+		FOR UPDATE
+	`, sessionID).Scan(&videoScore, &audioScore, &temporalScore)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read analysis row for session %s: %w", sessionID, err)
+	}
+
+	riskScore, riskVerdict, riskReasons := compute(videoScore, audioScore, temporalScore)
+	if err := writeRisk(ctx, tx, sessionID, riskScore, riskVerdict, riskReasons); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit risk finalization for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+func writeRisk(ctx context.Context, tx pgx.Tx, sessionID string, riskScore float64, riskVerdict string, riskReasons []string) error {
+	_, err := tx.Exec(ctx, `
 		UPDATE analysis_results
 		SET risk_score = $2, risk_verdict = $3, risk_reasons = $4
 		WHERE session_id = $1
 	`, sessionID, riskScore, riskVerdict, riskReasons)
 	if err != nil {
 		return fmt.Errorf("update risk assessment for session %s: %w", sessionID, err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit analysis upsert for session %s: %w", sessionID, err)
 	}
 	return nil
 }

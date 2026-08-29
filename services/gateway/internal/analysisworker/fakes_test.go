@@ -12,6 +12,7 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisjob"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
+	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 )
 
 // fakeHandler is a configurable analysisworker.Handler for worker/pool-
@@ -19,11 +20,13 @@ import (
 // timeout, dead-letter, shutdown) rather than any real detector or
 // database — see handler_test.go for tests of the real handlers.
 type fakeHandler struct {
-	mu            sync.Mutex
-	handleFunc    func(ctx context.Context, job analysisjob.AnalysisJob) error
-	permanentFunc func(error) bool
-	calls         []analysisjob.AnalysisJob
-	notify        chan analysisjob.AnalysisJob
+	mu              sync.Mutex
+	handleFunc      func(ctx context.Context, job analysisjob.AnalysisJob) error
+	permanentFunc   func(error) bool
+	onDeadLetter    func(ctx context.Context, job analysisjob.AnalysisJob) error
+	calls           []analysisjob.AnalysisJob
+	deadLetterCalls []analysisjob.AnalysisJob
+	notify          chan analysisjob.AnalysisJob
 }
 
 func newFakeHandler() *fakeHandler {
@@ -54,10 +57,123 @@ func (f *fakeHandler) IsPermanent(err error) bool {
 	return false
 }
 
+func (f *fakeHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error {
+	f.mu.Lock()
+	f.deadLetterCalls = append(f.deadLetterCalls, job)
+	f.mu.Unlock()
+	if f.onDeadLetter != nil {
+		return f.onDeadLetter(ctx, job)
+	}
+	return nil
+}
+
 func (f *fakeHandler) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+func (f *fakeHandler) deadLetterCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.deadLetterCalls)
+}
+
+// fakeJobsRepo is a minimal in-memory jobsrepo.Repository for
+// worker/pool/coordinator-level tests — see
+// internal/repository/jobs/postgres_test.go for tests against the real
+// implementation.
+type fakeJobsRepo struct {
+	mu   sync.Mutex
+	jobs map[string]jobsrepo.Job
+	err  error
+}
+
+func newFakeJobsRepo() *fakeJobsRepo {
+	return &fakeJobsRepo{jobs: make(map[string]jobsrepo.Job)}
+}
+
+func (f *fakeJobsRepo) Create(ctx context.Context, job jobsrepo.Job) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.jobs[job.ID] = job
+	return nil
+}
+
+func (f *fakeJobsRepo) Get(ctx context.Context, id string) (*jobsrepo.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[id]
+	if !ok {
+		return nil, jobsrepo.ErrNotFound
+	}
+	return &j, nil
+}
+
+func (f *fakeJobsRepo) GetLatestBySessionAndType(ctx context.Context, sessionID, jobType string) (*jobsrepo.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var latest *jobsrepo.Job
+	for _, j := range f.jobs {
+		if j.SessionID != sessionID || j.Type != jobType {
+			continue
+		}
+		jj := j
+		if latest == nil || jj.CreatedAt.After(latest.CreatedAt) {
+			latest = &jj
+		}
+	}
+	if latest == nil {
+		return nil, jobsrepo.ErrNotFound
+	}
+	return latest, nil
+}
+
+func (f *fakeJobsRepo) MarkProcessing(ctx context.Context, id string, attempt int) error {
+	return f.update(id, func(j *jobsrepo.Job) { j.Status = jobsrepo.StatusProcessing; j.Attempt = attempt })
+}
+
+func (f *fakeJobsRepo) MarkCompleted(ctx context.Context, id string) error {
+	return f.update(id, func(j *jobsrepo.Job) { j.Status = jobsrepo.StatusCompleted })
+}
+
+func (f *fakeJobsRepo) MarkFailed(ctx context.Context, id string, attempt int, lastError string) error {
+	return f.update(id, func(j *jobsrepo.Job) {
+		j.Status = jobsrepo.StatusFailed
+		j.Attempt = attempt
+		j.LastError = lastError
+	})
+}
+
+func (f *fakeJobsRepo) MarkDeadLetter(ctx context.Context, id string, lastError string) error {
+	return f.update(id, func(j *jobsrepo.Job) { j.Status = jobsrepo.StatusDeadLetter; j.LastError = lastError })
+}
+
+func (f *fakeJobsRepo) update(id string, mutate func(*jobsrepo.Job)) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	j, ok := f.jobs[id]
+	if !ok {
+		return jobsrepo.ErrNotFound
+	}
+	mutate(&j)
+	f.jobs[id] = j
+	return nil
+}
+
+// put seeds a job record directly, bypassing Create — a convenience
+// for tests that only care about a job's status when queried by the
+// coordinator, not the exact fields Create would have set.
+func (f *fakeJobsRepo) put(job jobsrepo.Job) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jobs[job.ID] = job
 }
 
 func testLogger() *slog.Logger {
