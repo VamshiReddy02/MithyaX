@@ -37,9 +37,13 @@ type Config struct {
 	WorkerCount int
 	// WorkerQueueSize bounds how many analyze jobs may be queued at once.
 	WorkerQueueSize int
-	// RedisAddr is the address (host:port) of the Redis instance backing
-	// job state and the job queue.
-	RedisAddr string
+	// RedisURL is the connection string for the Redis instance backing
+	// job state, the job queue, and (from Phase 7.3) the gateway's
+	// broader coordination/queue infrastructure (see internal/redis,
+	// internal/queue). Unlike DatabaseURL, this carries no credential in
+	// the current setup (docker-compose's redis service has no auth
+	// configured), so a non-secret default is fine here.
+	RedisURL string
 	// DatabaseURL is the PostgreSQL connection string backing persisted
 	// session records (see internal/database, internal/repository/sessions).
 	// Required — see Load, which errors rather than defaulting to any
@@ -88,7 +92,7 @@ const (
 	defaultAudioDetectorTimeout  = 60 * time.Second
 	defaultWorkerCount           = 4
 	defaultWorkerQueueSize       = 64
-	defaultRedisAddr             = "localhost:6379"
+	defaultRedisURL              = "redis://localhost:6379"
 	defaultJobTTL                = 24 * time.Hour
 	defaultRealtimeMaxVideoQueue = 10
 	defaultRealtimeVideoWorkers  = 2
@@ -114,7 +118,7 @@ func Load() (Config, error) {
 		AudioDetectorTimeout:  defaultAudioDetectorTimeout,
 		WorkerCount:           defaultWorkerCount,
 		WorkerQueueSize:       defaultWorkerQueueSize,
-		RedisAddr:             getEnv("GATEWAY_REDIS_ADDR", defaultRedisAddr),
+		RedisURL:              getEnv("GATEWAY_REDIS_URL", defaultRedisURL),
 		DatabaseURL:           os.Getenv("GATEWAY_DATABASE_URL"),
 		JobTTL:                defaultJobTTL,
 		RealtimeMaxVideoQueue: defaultRealtimeMaxVideoQueue,
@@ -214,6 +218,10 @@ func Load() (Config, error) {
 	}
 	if _, err := url.ParseRequestURI(cfg.DatabaseURL); err != nil {
 		return Config{}, fmt.Errorf("invalid GATEWAY_DATABASE_URL %q: %w", cfg.DatabaseURL, err)
+	}
+
+	if _, err := url.ParseRequestURI(cfg.RedisURL); err != nil {
+		return Config{}, fmt.Errorf("invalid GATEWAY_REDIS_URL %q: %w", cfg.RedisURL, err)
 	}
 
 	return cfg, nil

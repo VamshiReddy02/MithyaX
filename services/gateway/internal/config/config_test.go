@@ -43,6 +43,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DatabaseURL != "postgres://user:pass@localhost:5432/mithyax" {
 		t.Errorf("DatabaseURL = %q, want the value GATEWAY_DATABASE_URL was set to", cfg.DatabaseURL)
 	}
+	if cfg.RedisURL != defaultRedisURL {
+		t.Errorf("RedisURL = %q, want %q", cfg.RedisURL, defaultRedisURL)
+	}
 	if cfg.WorkerCount != defaultWorkerCount {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, defaultWorkerCount)
 	}
@@ -79,6 +82,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_AUDIO_DETECTOR_URL", "http://audio-detector:9001")
 	t.Setenv("GATEWAY_AUDIO_DETECTOR_TIMEOUT", "45s")
 	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@db:5432/mithyax_test")
+	t.Setenv("GATEWAY_REDIS_URL", "redis://cache:6379")
 	t.Setenv("GATEWAY_WORKER_COUNT", "8")
 	t.Setenv("GATEWAY_WORKER_QUEUE_SIZE", "256")
 	t.Setenv("GATEWAY_WORKER_SHUTDOWN_TIMEOUT", "3m")
@@ -119,6 +123,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.DatabaseURL != "postgres://user:pass@db:5432/mithyax_test" {
 		t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, "postgres://user:pass@db:5432/mithyax_test")
+	}
+	if cfg.RedisURL != "redis://cache:6379" {
+		t.Errorf("RedisURL = %q, want %q", cfg.RedisURL, "redis://cache:6379")
 	}
 	if cfg.WorkerCount != 8 {
 		t.Errorf("WorkerCount = %d, want %d", cfg.WorkerCount, 8)
@@ -242,6 +249,15 @@ func TestLoad_InvalidDatabaseURL(t *testing.T) {
 func TestLoad_MissingDatabaseURL(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with GATEWAY_DATABASE_URL unset: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRedisURL(t *testing.T) {
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+	t.Setenv("GATEWAY_REDIS_URL", "not-a-url")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_REDIS_URL: expected error, got nil")
 	}
 }
 

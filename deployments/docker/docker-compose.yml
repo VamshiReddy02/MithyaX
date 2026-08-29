@@ -51,7 +51,7 @@ services:
       # CPU-only inference inside the container (no MPS/GPU passthrough)
       # is much slower than a host run, so this needs real headroom.
       GATEWAY_DETECTOR_TIMEOUT: 300s
-      GATEWAY_REDIS_ADDR: redis:6379
+      GATEWAY_REDIS_URL: redis://redis:6379
       GATEWAY_DATABASE_URL: postgres://${POSTGRES_USER:?set POSTGRES_USER in deployments/docker/.env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deployments/docker/.env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in deployments/docker/.env}
     depends_on:
       video-detector:

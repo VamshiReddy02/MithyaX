@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
@@ -18,6 +16,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/middleware"
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
+	ourredis "github.com/vamshireddy02/mithyax/gateway/internal/redis"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
@@ -33,7 +32,7 @@ import (
 type Server struct {
 	HTTP  *http.Server
 	Pool  *worker.Pool
-	Redis *redis.Client
+	Redis *ourredis.Client
 	DB    *database.DB
 }
 
@@ -54,11 +53,10 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	audioClient := audio.NewClient(cfg.AudioDetectorBaseURL, cfg.AudioDetectorTimeout)
 	signalingHub := websocket.NewHub()
 
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:        cfg.RedisAddr,
-		DialTimeout: 3 * time.Second,
-		MaxRetries:  2,
-	})
+	redisClient, err := ourredis.New(cfg.RedisURL)
+	if err != nil {
+		return nil, fmt.Errorf("build redis client: %w", err)
+	}
 
 	db, err := database.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {
@@ -66,8 +64,8 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 	sessionRepo := sessionrepo.NewPostgres(db.Pool)
 	analysisRepo := analysisrepo.NewPostgres(db.Pool)
-	jobQueue := worker.NewQueue(redisClient, cfg.WorkerQueueSize)
-	jobStore := worker.NewStore(redisClient, cfg.JobTTL)
+	jobQueue := worker.NewQueue(redisClient.Client, cfg.WorkerQueueSize)
+	jobStore := worker.NewStore(redisClient.Client, cfg.JobTTL)
 	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
 	pool.Start(cfg.WorkerCount)
 
@@ -83,7 +81,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 	liveSessionStore := realtime.NewStore(detectorClient, audioClient, temporalAnalyzer, riskEngine, realtimeCfg)
 
-	router.GET("/health", handlers.Health)
+	router.GET("/health", handlers.NewHealth(db, redisClient))
 
 	v1 := router.Group("/api/v1")
 	v1.POST("/analyze", handlers.NewAnalyze(pool))

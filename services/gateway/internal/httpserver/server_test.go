@@ -63,7 +63,7 @@ func TestServer_Routes(t *testing.T) {
 		AudioDetectorTimeout: 5 * time.Second,
 		WorkerCount:          2,
 		WorkerQueueSize:      8,
-		RedisAddr:            mr.Addr(),
+		RedisURL:             "redis://" + mr.Addr(),
 		JobTTL:               time.Hour,
 	}, logger)
 	if err != nil {
@@ -75,13 +75,31 @@ func TestServer_Routes(t *testing.T) {
 	ts := httptest.NewServer(srv.HTTP.Handler)
 	defer ts.Close()
 
+	// /health now actually pings Postgres and Redis (see
+	// handlers.NewHealth) rather than always answering 200 — this test
+	// doesn't configure a real DatabaseURL (that'd depend on whatever
+	// Postgres happens to be reachable on the machine running the
+	// tests), so it only checks the route is wired to the right handler
+	// shape. The health-check logic itself — healthy/unhealthy for each
+	// dependency independently — is covered deterministically with fakes
+	// in internal/handlers/health_test.go.
 	resp, err := http.Get(ts.URL + "/health")
 	if err != nil {
 		t.Fatalf("GET /health: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /health status = %d, want %d", resp.StatusCode, http.StatusOK)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("GET /health status = %d, want %d or %d", resp.StatusCode, http.StatusOK, http.StatusServiceUnavailable)
+	}
+	var health handlers.HealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("decode GET /health response: %v", err)
+	}
+	if _, ok := health.Checks["redis"]; !ok {
+		t.Error(`GET /health response missing "redis" check`)
+	}
+	if health.Checks["redis"] != "healthy" {
+		t.Errorf(`Checks["redis"] = %q, want "healthy" (a real miniredis is configured for this test)`, health.Checks["redis"])
 	}
 
 	resp2, err := http.Post(ts.URL+"/api/v1/analyze", "application/json", nil)
