@@ -14,7 +14,9 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -36,9 +38,18 @@ const (
 
 // Identity is what Middleware attaches to a successfully authenticated
 // request's context — the "who" that RequireRole later checks the
-// "what can they do" against.
+// "what can they do" against, and (from Phase 7.7.3) what
+// internal/ratelimit keys a client's request-count bucket on.
 type Identity struct {
 	Role Role
+	// ClientKey identifies which configured token authenticated this
+	// request, without being the token itself — see clientKey. Two
+	// requests authenticated with different tokens always get different
+	// ClientKeys (so, per 7.7.3, admin and user never share a rate-limit
+	// bucket just because a naive key derived only from Role would
+	// collapse them together); two requests with the same token always
+	// get the same one.
+	ClientKey string
 }
 
 // identityContextKey is the gin.Context key Middleware stores an
@@ -106,9 +117,21 @@ func Middleware(tokens map[string]Role) gin.HandlerFunc {
 			return
 		}
 
-		SetIdentity(c, Identity{Role: role})
+		SetIdentity(c, Identity{Role: role, ClientKey: clientKey(provided)})
 		c.Next()
 	}
+}
+
+// clientKey derives a stable, non-reversible identifier from an
+// authenticated token — for use anywhere (see internal/ratelimit) that
+// needs to key state per-caller without ever storing or transmitting
+// the raw credential itself, e.g. as part of a Redis key name where it
+// could otherwise show up in KEYS, MONITOR, or a slow-query log. A
+// truncated SHA-256 hex digest is already effectively collision-free
+// for the small, fixed set of tokens this phase configures.
+func clientKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // matchToken compares provided against every key of tokens in constant

@@ -135,6 +135,57 @@ func TestAuth_ValidAdminToken(t *testing.T) {
 	}
 }
 
+// TestAuth_ClientKey_DistinctPerToken proves 7.7.3's requirement that
+// admin and user identities never accidentally share a rate-limit
+// bucket: ClientKey is derived from which token authenticated the
+// request, not from Role, so two different tokens always produce two
+// different ClientKeys even though there are only two roles.
+func TestAuth_ClientKey_DistinctPerToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(auth.Middleware(testTokens()))
+	var got auth.Identity
+	router.GET("/protected", func(c *gin.Context) {
+		got, _ = auth.IdentityFromContext(c)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	doRequest(t, router, "/protected", "Bearer "+testToken)
+	userKey := got.ClientKey
+
+	doRequest(t, router, "/protected", "Bearer "+testAdminToken)
+	adminKey := got.ClientKey
+
+	if userKey == "" || adminKey == "" {
+		t.Fatalf("ClientKey should never be empty for an authenticated request: user=%q admin=%q", userKey, adminKey)
+	}
+	if userKey == adminKey {
+		t.Error("user and admin tokens produced the same ClientKey — they would share a rate-limit bucket")
+	}
+}
+
+// TestAuth_ClientKey_SameTokenSameKey proves ClientKey is stable for
+// repeated requests with the same token — a rate limiter needs the
+// same caller to always land in the same bucket.
+func TestAuth_ClientKey_SameTokenSameKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(auth.Middleware(testTokens()))
+	var keys []string
+	router.GET("/protected", func(c *gin.Context) {
+		identity, _ := auth.IdentityFromContext(c)
+		keys = append(keys, identity.ClientKey)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	doRequest(t, router, "/protected", "Bearer "+testToken)
+	doRequest(t, router, "/protected", "Bearer "+testToken)
+
+	if len(keys) != 2 || keys[0] != keys[1] {
+		t.Errorf("ClientKey across two requests with the same token = %v, want identical values", keys)
+	}
+}
+
 // TestAuth_DoesNotLeakToken proves a rejection's response never echoes
 // back a configured token, the caller's wrong guess, or anything else
 // that could confirm/deny part of it. The fixed {"error":

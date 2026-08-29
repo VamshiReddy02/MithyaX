@@ -343,3 +343,87 @@ func TestServer_AuthWiring(t *testing.T) {
 		t.Errorf("GET /sessions/metrics with no token status = %d, want %d", noAuthMetricsResp.StatusCode, http.StatusUnauthorized)
 	}
 }
+
+// TestServer_RateLimitWiring proves 7.7.3's routing decision: POST
+// /api/v1/analysis is capped at analysisCreateRateLimit (10/minute),
+// stricter than every other /api/v1 route's defaultRateLimit
+// (60/minute) — and an unauthenticated request never gets 429, only
+// 401, since auth.Middleware runs first and rejects it before
+// ratelimit.Middleware is ever reached. internal/ratelimit's own tests
+// cover the limiter and its Gin middleware in isolation; this is only
+// about which limit server.go actually applied to which route.
+func TestServer_RateLimitWiring(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                 "0",
+		Environment:          "test",
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          1,
+		WorkerQueueSize:      1,
+		RedisURL:             "redis://" + mr.Addr(),
+		JobTTL:               time.Hour,
+		AuthToken:            testAuthToken,
+		AdminAuthToken:       testAdminAuthToken,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	// Unauthenticated request on the stricter route: 401, never 429 —
+	// proven before ever touching the limit itself, since a client
+	// racing straight for /api/v1/analysis without a token must never
+	// see a rate-limit response.
+	noAuthResp, err := http.Post(ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST /api/v1/analysis (no auth): %v", err)
+	}
+	defer noAuthResp.Body.Close()
+	if noAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/analysis with no token status = %d, want %d", noAuthResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// 10 authenticated requests against POST /api/v1/analysis must all
+	// avoid the rate limiter (whatever the handler itself does with an
+	// empty body — no database is configured here, so it may well fail
+	// validation or persistence, but that's a different status, never
+	// 429). The 11th must be rate-limited.
+	const analysisLimit = 10
+	for i := 1; i <= analysisLimit; i++ {
+		resp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(`{}`))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("POST /api/v1/analysis request %d/%d status = %d, want anything but %d this early", i, analysisLimit, resp.StatusCode, http.StatusTooManyRequests)
+		}
+	}
+	overLimitResp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(`{}`))
+	defer overLimitResp.Body.Close()
+	if overLimitResp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("POST /api/v1/analysis request %d status = %d, want %d", analysisLimit+1, overLimitResp.StatusCode, http.StatusTooManyRequests)
+	}
+	if retryAfter := overLimitResp.Header.Get("Retry-After"); retryAfter == "" {
+		t.Error("Retry-After header missing on a 429 response")
+	}
+
+	// A different route in the shared "default" scope, for the very
+	// same (now analysis-create-exhausted) client, must still work —
+	// the stricter scope's exhaustion must not bleed into the default
+	// scope's own separate budget.
+	otherRouteResp := doAuthed(t, http.MethodGet, ts.URL+"/api/v1/analysis/jobs/does-not-exist", "", nil)
+	defer otherRouteResp.Body.Close()
+	if otherRouteResp.StatusCode == http.StatusTooManyRequests {
+		t.Error("GET /api/v1/analysis/jobs/:id status = 429 — exhausting POST /api/v1/analysis's own limit must not affect the default scope")
+	}
+}

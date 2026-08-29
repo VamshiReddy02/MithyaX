@@ -18,6 +18,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/middleware"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
+	"github.com/vamshireddy02/mithyax/gateway/internal/ratelimit"
 	"github.com/vamshireddy02/mithyax/gateway/internal/realtime"
 	ourredis "github.com/vamshireddy02/mithyax/gateway/internal/redis"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
@@ -36,6 +37,17 @@ import (
 // queue depth gets its own setting only once real usage says the
 // default needs tuning.
 const asyncQueueCapacity = 1000
+
+// Requests-per-minute ceilings for Phase 7.7.3's rate limiter.
+// defaultRateLimit covers every /api/v1 route by default;
+// analysisCreateRateLimit is layered on top of (not instead of) that
+// default specifically for POST /api/v1/analysis, the one route
+// expensive enough (it creates async jobs that go on to call a
+// Python detector) to warrant a stricter ceiling of its own.
+const (
+	defaultRateLimit        = 60
+	analysisCreateRateLimit = 10
+)
 
 // Server bundles the HTTP server with the background job pools (and the
 // Redis and PostgreSQL clients they depend on) so callers can shut all
@@ -149,17 +161,22 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	// can call it without a token (7.7.1).
 	router.GET("/health", handlers.NewHealth(db, redisClient))
 
-	// Authentication (who is this caller) and authorization (what can
-	// they do) stay separate middleware stages (7.7.2): every /api/v1
-	// route requires a valid token via auth.Middleware, which attaches
-	// the matched token's Role to the request; a route can additionally
-	// require auth.RequireRole(auth.RoleAdmin) — see /sessions/metrics
-	// below, the one admin-only route so far.
+	// Authentication (who is this caller), authorization (what can they
+	// do), and rate limiting (how much can they do it) stay separate
+	// middleware stages in that order (7.7.1/7.7.2/7.7.3):
+	//   auth.Middleware -> auth.RequireRole -> ratelimit.Middleware -> handler
+	// Rate limiting runs after authentication specifically so an
+	// unauthenticated request gets 401, never 429 — auth.Middleware
+	// already rejects it before ratelimit.Middleware ever sees it.
+	// Redis-backed (internal/ratelimit) rather than in-memory so the
+	// limit stays meaningful if the gateway ever runs multiple replicas.
+	limiter := ratelimit.New(redisClient.Client)
 	v1 := router.Group("/api/v1")
 	v1.Use(auth.Middleware(map[string]auth.Role{
 		cfg.AuthToken:      auth.RoleUser,
 		cfg.AdminAuthToken: auth.RoleAdmin,
 	}))
+	v1.Use(ratelimit.Middleware(limiter, "default", defaultRateLimit, logger))
 	v1.POST("/analyze", handlers.NewAnalyze(pool))
 	v1.GET("/analyze/:id", handlers.NewJobStatus(jobStore))
 	v1.POST("/analyze-frame", handlers.NewAnalyzeFrame(detectorClient))
@@ -170,7 +187,10 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 	v1.GET("/sessions/metrics", auth.RequireRole(auth.RoleAdmin), handlers.NewSessionMetrics(liveSessionStore))
 	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
-	v1.POST("/analysis", handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, logger))
+	// POST /analysis gets a stricter limit layered on top of the
+	// group's default 60/min — it creates async jobs that go on to call
+	// a Python detector, so it's worth capping harder than a cheap GET.
+	v1.POST("/analysis", ratelimit.Middleware(limiter, "analysis-create", analysisCreateRateLimit, logger), handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, logger))
 	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))
 
 	return &Server{
