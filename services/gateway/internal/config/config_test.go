@@ -70,6 +70,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RealtimeMaxSessions != defaultRealtimeMaxSessions {
 		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, defaultRealtimeMaxSessions)
 	}
+	if cfg.VideoWorkers != defaultVideoWorkers {
+		t.Errorf("VideoWorkers = %d, want %d", cfg.VideoWorkers, defaultVideoWorkers)
+	}
+	if cfg.AudioWorkers != defaultAudioWorkers {
+		t.Errorf("AudioWorkers = %d, want %d", cfg.AudioWorkers, defaultAudioWorkers)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -91,6 +97,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("REALTIME_MAX_AUDIO_QUEUE", "15")
 	t.Setenv("REALTIME_AUDIO_WORKERS", "3")
 	t.Setenv("REALTIME_MAX_SESSIONS", "50")
+	t.Setenv("GATEWAY_VIDEO_WORKERS", "5")
+	t.Setenv("GATEWAY_AUDIO_WORKERS", "4")
 
 	cfg, err := Load()
 	if err != nil {
@@ -150,6 +158,28 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.RealtimeMaxSessions != 50 {
 		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, 50)
+	}
+	if cfg.VideoWorkers != 5 {
+		t.Errorf("VideoWorkers = %d, want %d", cfg.VideoWorkers, 5)
+	}
+	if cfg.AudioWorkers != 4 {
+		t.Errorf("AudioWorkers = %d, want %d", cfg.AudioWorkers, 4)
+	}
+}
+
+func TestLoad_InvalidVideoWorkers(t *testing.T) {
+	t.Setenv("GATEWAY_VIDEO_WORKERS", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_VIDEO_WORKERS=0: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidAudioWorkers(t *testing.T) {
+	t.Setenv("GATEWAY_AUDIO_WORKERS", "not-a-number")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_AUDIO_WORKERS: expected error, got nil")
 	}
 }
 

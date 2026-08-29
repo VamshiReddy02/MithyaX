@@ -208,3 +208,30 @@ func (q *Redis) length(ctx context.Context, key string) (int64, error) {
 	}
 	return n, nil
 }
+
+// RecoverStale moves every job currently sitting in the processing list
+// back to the front of pending — recovering whatever a worker left
+// behind by exiting without acking or failing it (a crash, a kill -9,
+// anything that skipped graceful shutdown). Typically called once at
+// startup, before a Pool begins consuming, so jobs stranded by a
+// previous run's crash actually get reprocessed rather than sitting
+// merely inspectable forever. Not part of the Queue interface: which
+// jobs are "in flight" is a Redis-specific notion (the processing
+// list), not something every possible Queue implementation need share.
+//
+// Non-blocking and returns immediately once processing is empty — this
+// drains whatever is there right now, it doesn't wait for more to
+// arrive.
+func (q *Redis) RecoverStale(ctx context.Context) (int, error) {
+	var n int
+	for {
+		_, err := q.client.LMove(ctx, q.processingKey(), q.key, "LEFT", "LEFT").Result()
+		if errors.Is(err, goredis.Nil) {
+			return n, nil
+		}
+		if err != nil {
+			return n, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
+		}
+		n++
+	}
+}

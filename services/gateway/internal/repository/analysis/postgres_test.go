@@ -134,3 +134,146 @@ func TestPostgres_GetBySessionID_NotFound(t *testing.T) {
 		t.Errorf("GetBySessionID() error = %v, want ErrNotFound", err)
 	}
 }
+
+// meanCompute is a minimal, deterministic stand-in for the real risk
+// engine's weighting — this package doesn't depend on internal/risk
+// (see ComputeRisk's doc comment), so tests supply their own simple
+// combiner instead of a real one.
+func meanCompute(video, audio, temporal *float64) (float64, string, []string) {
+	var sum float64
+	var n int
+	for _, s := range []*float64{video, audio, temporal} {
+		if s != nil {
+			sum += *s
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, "UNKNOWN", nil
+	}
+	score := sum / float64(n)
+	verdict := "LIKELY_AUTHENTIC"
+	if score >= 0.6 {
+		verdict = "LIKELY_FAKE"
+	}
+	return score, verdict, []string{fmt.Sprintf("combined %d signal(s)", n)}
+}
+
+func TestPostgres_UpsertVideoResult_CreatesRow(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	if err := analyses.UpsertVideoResult(ctx, sessionID, 0.9, "fake", meanCompute); err != nil {
+		t.Fatalf("UpsertVideoResult() error = %v", err)
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.VideoFakeScore == nil || *got.VideoFakeScore != 0.9 || got.VideoVerdict != "fake" {
+		t.Errorf("video result = (%v, %q), want (0.9, fake)", got.VideoFakeScore, got.VideoVerdict)
+	}
+	if got.AudioFakeScore != nil {
+		t.Errorf("AudioFakeScore = %v, want nil — no audio job has run for this session", got.AudioFakeScore)
+	}
+	if got.RiskScore != 0.9 || got.RiskVerdict != "LIKELY_FAKE" {
+		t.Errorf("risk = (%v, %q), want (0.9, LIKELY_FAKE) — computed from video alone", got.RiskScore, got.RiskVerdict)
+	}
+}
+
+// TestPostgres_UpsertVideoThenAudio_Merges is the core proof behind
+// 7.5.2/7.5.3's independent VideoWorker/AudioWorker: two separate async
+// jobs for the same session, completing in sequence, must merge into
+// one row rather than the second overwriting the first's contribution.
+func TestPostgres_UpsertVideoThenAudio_Merges(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	if err := analyses.UpsertVideoResult(ctx, sessionID, 0.8, "fake", meanCompute); err != nil {
+		t.Fatalf("UpsertVideoResult() error = %v", err)
+	}
+	if err := analyses.UpsertAudioResult(ctx, sessionID, 0.4, "real", meanCompute); err != nil {
+		t.Fatalf("UpsertAudioResult() error = %v", err)
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.VideoFakeScore == nil || *got.VideoFakeScore != 0.8 {
+		t.Errorf("VideoFakeScore = %v, want 0.8 (the audio upsert must not clobber it)", got.VideoFakeScore)
+	}
+	if got.AudioFakeScore == nil || *got.AudioFakeScore != 0.4 {
+		t.Errorf("AudioFakeScore = %v, want 0.4", got.AudioFakeScore)
+	}
+	wantRisk := (0.8 + 0.4) / 2
+	if got.RiskScore != wantRisk {
+		t.Errorf("RiskScore = %v, want %v (mean of both signals)", got.RiskScore, wantRisk)
+	}
+}
+
+// TestPostgres_UpsertVideoResult_Idempotent proves re-running the same
+// upsert (simulating a redelivered job re-executing after its Ack was
+// lost — see 7.5.8) leaves the row exactly as it was, not duplicated or
+// corrupted.
+func TestPostgres_UpsertVideoResult_Idempotent(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if err := analyses.UpsertVideoResult(ctx, sessionID, 0.7, "fake", meanCompute); err != nil {
+			t.Fatalf("UpsertVideoResult() call #%d error = %v", i+1, err)
+		}
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.VideoFakeScore == nil || *got.VideoFakeScore != 0.7 {
+		t.Errorf("VideoFakeScore = %v, want 0.7 after 3 identical upserts", got.VideoFakeScore)
+	}
+	if got.RiskScore != 0.7 {
+		t.Errorf("RiskScore = %v, want 0.7 (repeated upserts must not accumulate/compound)", got.RiskScore)
+	}
+}
+
+// TestPostgres_ConcurrentUpserts_DoNotRace fires video and audio
+// upserts for the same session from concurrent goroutines and checks
+// the final row reflects both — proving the row-level lock in
+// upsertModality actually serializes the two rather than one clobbering
+// the other's read of "what's currently there."
+func TestPostgres_ConcurrentUpserts_DoNotRace(t *testing.T) {
+	analyses, sessions := newTestRepositories(t)
+	sessionID := createParentSession(t, sessions)
+	ctx := context.Background()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- analyses.UpsertVideoResult(ctx, sessionID, 0.75, "fake", meanCompute) }()
+	go func() { errCh <- analyses.UpsertAudioResult(ctx, sessionID, 0.25, "real", meanCompute) }()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent upsert error = %v", err)
+		}
+	}
+
+	got, err := analyses.GetBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetBySessionID() error = %v", err)
+	}
+	if got.VideoFakeScore == nil || *got.VideoFakeScore != 0.75 {
+		t.Errorf("VideoFakeScore = %v, want 0.75", got.VideoFakeScore)
+	}
+	if got.AudioFakeScore == nil || *got.AudioFakeScore != 0.25 {
+		t.Errorf("AudioFakeScore = %v, want 0.25", got.AudioFakeScore)
+	}
+	wantRisk := (0.75 + 0.25) / 2
+	if got.RiskScore != wantRisk {
+		t.Errorf("RiskScore = %v, want %v — whichever upsert finished last must have seen the other's committed write", got.RiskScore, wantRisk)
+	}
+}

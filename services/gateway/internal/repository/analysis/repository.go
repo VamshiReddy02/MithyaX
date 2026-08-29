@@ -44,12 +44,22 @@ type Result struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ComputeRisk recomputes a combined risk score/verdict/reasons from
+// whatever video/audio/temporal scores are on record after an upsert —
+// nil for any signal that's never completed. Supplied by the caller
+// (see internal/analysisworker) rather than this package importing
+// internal/risk directly, so the actual weighting/threshold logic for
+// combining signals stays out of the persistence layer.
+type ComputeRisk func(videoScore, audioScore, temporalScore *float64) (riskScore float64, riskVerdict string, riskReasons []string)
+
 // Repository persists analysis results. *Postgres is the only
 // implementation; handlers depend on this interface instead, the same
 // separation internal/repository/sessions uses.
 type Repository interface {
-	// Create records a completed session's full analysis. Since this is
-	// 1:1 with sessions (see the schema comment in
+	// Create records a completed session's full analysis in one shot —
+	// used by the live WebSocket pipeline (internal/realtime), which
+	// already has every signal it'll ever have by the time a session
+	// ends. Since this is 1:1 with sessions (see the schema comment in
 	// 0002_create_analysis_results.sql), calling it twice for the same
 	// SessionID is a bug in the caller, not a case to silently handle.
 	Create(ctx context.Context, result Result) error
@@ -57,4 +67,22 @@ type Repository interface {
 	// ErrNotFound if none exists yet (the session hasn't completed) or
 	// ever will (the session ID is unknown).
 	GetBySessionID(ctx context.Context, sessionID string) (*Result, error)
+	// UpsertVideoResult records (or updates) sessionID's video signal —
+	// creating the row if this is the first modality to complete for
+	// this session, or merging into an existing row an
+	// UpsertAudioResult call already created — and recomputes the
+	// combined risk via compute, atomically with respect to a
+	// concurrent UpsertAudioResult for the same session. Used by
+	// VideoWorker (Phase 7.5): the async job path, where video and
+	// audio for one session are independent jobs that can complete in
+	// either order or concurrently, unlike the WebSocket path's single
+	// Create.
+	//
+	// Idempotent by construction: calling it again with the same
+	// sessionID/score/verdict (e.g. a redelivered job re-executing
+	// after an ack was lost) just overwrites the same values and
+	// recomputes the same risk — never a second row, never corruption.
+	UpsertVideoResult(ctx context.Context, sessionID string, videoScore float64, videoVerdict string, compute ComputeRisk) error
+	// UpsertAudioResult is UpsertVideoResult's audio counterpart.
+	UpsertAudioResult(ctx context.Context, sessionID string, audioScore float64, audioVerdict string, compute ComputeRisk) error
 }

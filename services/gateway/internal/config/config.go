@@ -78,6 +78,14 @@ type Config struct {
 	// memory growth if far more sessions are created than the detector
 	// services can actually keep up with.
 	RealtimeMaxSessions int
+	// VideoWorkers is how many goroutines concurrently consume
+	// VIDEO_ANALYSIS jobs from the async Redis queue (see
+	// internal/analysisworker). Unrelated to RealtimeVideoWorkers, which
+	// serves the live WebSocket pipeline, not this one.
+	VideoWorkers int
+	// AudioWorkers is how many goroutines concurrently consume
+	// AUDIO_ANALYSIS jobs from the async Redis queue.
+	AudioWorkers int
 }
 
 const (
@@ -99,6 +107,8 @@ const (
 	defaultRealtimeMaxAudioQueue = 10
 	defaultRealtimeAudioWorkers  = 2
 	defaultRealtimeMaxSessions   = 100
+	defaultVideoWorkers          = 2
+	defaultAudioWorkers          = 2
 )
 
 // Load builds a Config from environment variables, falling back to
@@ -126,6 +136,8 @@ func Load() (Config, error) {
 		RealtimeMaxAudioQueue: defaultRealtimeMaxAudioQueue,
 		RealtimeAudioWorkers:  defaultRealtimeAudioWorkers,
 		RealtimeMaxSessions:   defaultRealtimeMaxSessions,
+		VideoWorkers:          defaultVideoWorkers,
+		AudioWorkers:          defaultAudioWorkers,
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -198,6 +210,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RealtimeMaxSessions, err = positiveIntEnv("REALTIME_MAX_SESSIONS", cfg.RealtimeMaxSessions); err != nil {
+		return Config{}, err
+	}
+	if cfg.VideoWorkers, err = positiveIntEnv("GATEWAY_VIDEO_WORKERS", cfg.VideoWorkers); err != nil {
+		return Config{}, err
+	}
+	if cfg.AudioWorkers, err = positiveIntEnv("GATEWAY_AUDIO_WORKERS", cfg.AudioWorkers); err != nil {
 		return Config{}, err
 	}
 

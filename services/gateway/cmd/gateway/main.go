@@ -95,6 +95,13 @@ func run() error {
 		return err
 	}
 
+	// Stop the async video/audio worker pools (Phase 7.5) the same way:
+	// let an in-flight job finish rather than cutting it off. Bounded
+	// by that job's own timeout, not a separate shutdown deadline —
+	// see Server.StopWorkers.
+	logger.Info("waiting for in-flight async analysis jobs to finish")
+	srv.StopWorkers()
+
 	if err := srv.Redis.Close(); err != nil {
 		logger.Warn("failed to close redis client cleanly", slog.String("error", err.Error()))
 	}

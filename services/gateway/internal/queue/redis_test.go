@@ -274,6 +274,64 @@ func TestRedis_CrashedConsumer_JobSurvivesInProcessing(t *testing.T) {
 	}
 }
 
+// TestRedis_RecoverStale proves a job stranded in processing by a
+// crashed consumer (see the test above) is actually recoverable, not
+// just inspectable: after RecoverStale, it's back in pending and a
+// completely fresh Dequeue picks it up like any other job.
+func TestRedis_RecoverStale(t *testing.T) {
+	client := newTestRedis(t)
+	q := queue.NewRedis(client, "test:queue", 10)
+	ctx := context.Background()
+
+	if err := q.Enqueue(ctx, queue.Job{ID: "stuck-job"}); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+	if _, err := q.Dequeue(ctx); err != nil {
+		t.Fatalf("Dequeue() error = %v", err)
+	}
+	// ... crash, no Ack/Fail ...
+	if n, _ := q.ProcessingLen(ctx); n != 1 {
+		t.Fatalf("ProcessingLen() = %d, want 1 before recovery", n)
+	}
+
+	recovered, err := q.RecoverStale(ctx)
+	if err != nil {
+		t.Fatalf("RecoverStale() error = %v", err)
+	}
+	if recovered != 1 {
+		t.Errorf("RecoverStale() recovered %d jobs, want 1", recovered)
+	}
+	if n, _ := q.ProcessingLen(ctx); n != 0 {
+		t.Errorf("ProcessingLen() = %d after RecoverStale, want 0", n)
+	}
+	if n, _ := q.PendingLen(ctx); n != 1 {
+		t.Errorf("PendingLen() = %d after RecoverStale, want 1", n)
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	d, err := q.Dequeue(dctx)
+	if err != nil {
+		t.Fatalf("Dequeue() after recovery error = %v", err)
+	}
+	if d.Job.ID != "stuck-job" {
+		t.Errorf("Dequeue() after recovery = %q, want %q", d.Job.ID, "stuck-job")
+	}
+}
+
+func TestRedis_RecoverStale_NothingToRecover(t *testing.T) {
+	client := newTestRedis(t)
+	q := queue.NewRedis(client, "test:queue", 10)
+
+	recovered, err := q.RecoverStale(context.Background())
+	if err != nil {
+		t.Fatalf("RecoverStale() error = %v", err)
+	}
+	if recovered != 0 {
+		t.Errorf("RecoverStale() recovered %d jobs, want 0", recovered)
+	}
+}
+
 func TestRedis_Fail_MovesToFailedList(t *testing.T) {
 	client := newTestRedis(t)
 	q := queue.NewRedis(client, "test:queue", 10)

@@ -69,8 +69,11 @@ func TestServer_Routes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
 	}
-	defer srv.Pool.Shutdown(context.Background())
+	// Deferred in reverse of desired shutdown order: Redis must stay open
+	// until both pools have actually stopped touching it.
 	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
 
 	ts := httptest.NewServer(srv.HTTP.Handler)
 	defer ts.Close()

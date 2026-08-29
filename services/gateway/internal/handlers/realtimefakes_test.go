@@ -147,3 +147,28 @@ func (f *fakeAnalysisRepository) GetBySessionID(ctx context.Context, sessionID s
 	}
 	return &r, nil
 }
+
+func (f *fakeAnalysisRepository) UpsertVideoResult(ctx context.Context, sessionID string, score float64, verdict string, compute analysisrepo.ComputeRisk) error {
+	return f.upsert(sessionID, func(r *analysisrepo.Result) {
+		r.VideoFakeScore = &score
+		r.VideoVerdict = verdict
+	}, compute)
+}
+
+func (f *fakeAnalysisRepository) UpsertAudioResult(ctx context.Context, sessionID string, score float64, verdict string, compute analysisrepo.ComputeRisk) error {
+	return f.upsert(sessionID, func(r *analysisrepo.Result) {
+		r.AudioFakeScore = &score
+		r.AudioVerdict = verdict
+	}, compute)
+}
+
+func (f *fakeAnalysisRepository) upsert(sessionID string, apply func(*analysisrepo.Result), compute analysisrepo.ComputeRisk) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.results[sessionID]
+	r.SessionID = sessionID
+	apply(&r)
+	r.RiskScore, r.RiskVerdict, r.RiskReasons = compute(r.VideoFakeScore, r.AudioFakeScore, r.TemporalScore)
+	f.results[sessionID] = r
+	return nil
+}
