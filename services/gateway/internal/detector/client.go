@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
@@ -159,6 +160,43 @@ func (c *Client) Analyze(ctx context.Context, videoURL string) (*Result, error) 
 	}
 
 	respBody, err := c.post(ctx, "/analyze", "application/json", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result Result
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, &Error{Kind: KindDetectorError, Message: fmt.Sprintf("invalid video-detector response: %v", err)}
+	}
+	return &result, nil
+}
+
+// AnalyzeBytes uploads a video's raw bytes to the video-detector's
+// /analyze-upload endpoint and returns its Xception inference result,
+// the same shape Analyze returns — but without the video-detector ever
+// making an outbound request to fetch anything itself. This is what
+// internal/analysisworker.VideoHandler uses (7.7.5): the worker fetches
+// the video through its own SSRF-safe internal/security.SafeFetcher
+// first, then hands the resulting bytes here, so the only outbound
+// fetch of a client-supplied URL happens through code that validates
+// it. Analyze (above) still exists for callers that haven't migrated
+// off the URL-passthrough model.
+func (c *Client) AnalyzeBytes(ctx context.Context, filename string, data []byte) (*Result, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	part, err := writer.CreateFormFile("video", filename)
+	if err != nil {
+		return nil, &Error{Kind: KindUnknown, Message: err.Error()}
+	}
+	if _, err := part.Write(data); err != nil {
+		return nil, &Error{Kind: KindUnknown, Message: err.Error()}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, &Error{Kind: KindUnknown, Message: err.Error()}
+	}
+
+	respBody, err := c.post(ctx, "/analyze-upload", writer.FormDataContentType(), body.Bytes())
 	if err != nil {
 		return nil, err
 	}

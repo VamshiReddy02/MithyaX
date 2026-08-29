@@ -3,8 +3,6 @@ package analysisworker_test
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -14,17 +12,41 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
 
-// fakeVideoAnalyzer stands in for *detector.Client.
-type fakeVideoAnalyzer struct {
-	result *detector.Result
+// fakeVideoFetcher and fakeAudioFetcher both stand in for a
+// *analysisworker.SafeURLFetcher — VideoHandler and AudioHandler now
+// share the identical URLFetcher shape (7.7.5), fetching bytes before
+// ever calling a detector. Kept as two distinct (if identical) types
+// rather than one shared fake so each modality's tests read on their
+// own terms — small duplication over an abstraction neither side
+// actually needs.
+type fakeVideoFetcher struct {
+	data   []byte
 	err    error
 	gotURL string
 }
 
-func (f *fakeVideoAnalyzer) Analyze(ctx context.Context, videoURL string) (*detector.Result, error) {
+func (f *fakeVideoFetcher) Fetch(ctx context.Context, videoURL string) ([]byte, error) {
 	f.gotURL = videoURL
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.data, nil
+}
+
+// fakeVideoAnalyzer stands in for *detector.Client's AnalyzeBytes.
+type fakeVideoAnalyzer struct {
+	result      *detector.Result
+	err         error
+	gotFilename string
+	gotData     []byte
+}
+
+func (f *fakeVideoAnalyzer) AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error) {
+	f.gotFilename = filename
+	f.gotData = data
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -143,9 +165,10 @@ func noWaitCoordinator() *analysisworker.Coordinator {
 }
 
 func TestVideoHandler_Handle_Success(t *testing.T) {
+	fetcher := &fakeVideoFetcher{data: []byte("video-bytes")}
 	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.87, Verdict: "fake"}}
 	repo := newFakeAnalysisRepo()
-	h := analysisworker.NewVideoHandler(det, repo, noWaitCoordinator())
+	h := analysisworker.NewVideoHandler(fetcher, det, repo, noWaitCoordinator())
 
 	job, err := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	if err != nil {
@@ -155,8 +178,14 @@ func TestVideoHandler_Handle_Success(t *testing.T) {
 	if err := h.Handle(context.Background(), job); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
-	if det.gotURL != "https://example.com/video.mp4" {
-		t.Errorf("detector received URL %q, want %q", det.gotURL, "https://example.com/video.mp4")
+	if fetcher.gotURL != "https://example.com/video.mp4" {
+		t.Errorf("fetcher received URL %q, want %q", fetcher.gotURL, "https://example.com/video.mp4")
+	}
+	if det.gotFilename != "video.mp4" {
+		t.Errorf("detector received filename %q, want %q", det.gotFilename, "video.mp4")
+	}
+	if string(det.gotData) != "video-bytes" {
+		t.Errorf("detector received data %q, want %q", det.gotData, "video-bytes")
 	}
 
 	result, ok := repo.get("session-1")
@@ -168,9 +197,71 @@ func TestVideoHandler_Handle_Success(t *testing.T) {
 	}
 }
 
+// TestVideoHandler_Handle_PreservesFilenameFromURL proves the file
+// extension (a hint to the video-detector about the container format)
+// survives the move from URL to bytes, rather than being flattened to
+// a fixed name the way AudioHandler already does for audio.
+func TestVideoHandler_Handle_PreservesFilenameFromURL(t *testing.T) {
+	fetcher := &fakeVideoFetcher{data: []byte("video-bytes")}
+	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.1, Verdict: "real"}}
+	h := analysisworker.NewVideoHandler(fetcher, det, newFakeAnalysisRepo(), noWaitCoordinator())
+
+	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://cdn.example/clips/interview.mov")
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if det.gotFilename != "interview.mov" {
+		t.Errorf("detector received filename %q, want %q", det.gotFilename, "interview.mov")
+	}
+}
+
+func TestVideoHandler_Handle_FetchError(t *testing.T) {
+	fetcher := &fakeVideoFetcher{err: errors.New("connection reset")}
+	det := &fakeVideoAnalyzer{}
+	h := analysisworker.NewVideoHandler(fetcher, det, newFakeAnalysisRepo(), noWaitCoordinator())
+
+	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
+	if err := h.Handle(context.Background(), job); err == nil {
+		t.Fatal("Handle() error = nil, want the fetch error propagated")
+	}
+	if det.gotData != nil {
+		t.Error("the video-detector was called despite the fetch failing")
+	}
+}
+
+// TestVideoHandler_Handle_BlockedBySSRFValidation proves 7.7.5's core
+// guarantee at the handler level: a fetch blocked by SafeFetcher's SSRF
+// validation (surfaced here as a *security.FetchError, exactly what a
+// real SafeURLFetcher would return) never reaches the video-detector,
+// and is classified as permanent — retrying a blocked URL can't ever
+// succeed.
+func TestVideoHandler_Handle_BlockedBySSRFValidation(t *testing.T) {
+	blockedErr := &security.FetchError{Kind: security.FetchErrorBlocked, Message: "blocked by SSRF validation"}
+	fetcher := &fakeVideoFetcher{err: blockedErr}
+	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.5, Verdict: "real"}}
+	h := analysisworker.NewVideoHandler(fetcher, det, newFakeAnalysisRepo(), noWaitCoordinator())
+
+	job, err := analysisjob.NewVideoAnalysisJob("session-blocked", "http://127.0.0.1/internal.mp4")
+	if err != nil {
+		t.Fatalf("NewVideoAnalysisJob() error = %v", err)
+	}
+
+	handleErr := h.Handle(context.Background(), job)
+	if handleErr == nil {
+		t.Fatal("Handle() error = nil, want the blocked fetch error propagated")
+	}
+	if det.gotData != nil {
+		t.Error("the video-detector was called despite the URL failing SSRF validation")
+	}
+	if !h.IsPermanent(handleErr) {
+		t.Error("IsPermanent() = false, want true — a blocked URL will never become fetchable by retrying")
+	}
+}
+
 func TestVideoHandler_Handle_DetectorError(t *testing.T) {
+	fetcher := &fakeVideoFetcher{data: []byte("video-bytes")}
 	det := &fakeVideoAnalyzer{err: &detector.Error{Kind: detector.KindUnavailable, Message: "video-detector unreachable"}}
-	h := analysisworker.NewVideoHandler(det, newFakeAnalysisRepo(), noWaitCoordinator())
+	h := analysisworker.NewVideoHandler(fetcher, det, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	err := h.Handle(context.Background(), job)
@@ -183,7 +274,7 @@ func TestVideoHandler_Handle_DetectorError(t *testing.T) {
 }
 
 func TestVideoHandler_IsPermanent_InvalidVideo(t *testing.T) {
-	h := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
+	h := analysisworker.NewVideoHandler(&fakeVideoFetcher{}, &fakeVideoAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
 
 	err := &detector.Error{Kind: detector.KindInvalidVideo, Message: "unsupported format"}
 	if !h.IsPermanent(err) {
@@ -192,10 +283,11 @@ func TestVideoHandler_IsPermanent_InvalidVideo(t *testing.T) {
 }
 
 func TestVideoHandler_Handle_RepositoryError(t *testing.T) {
+	fetcher := &fakeVideoFetcher{data: []byte("video-bytes")}
 	det := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.5, Verdict: "real"}}
 	repo := newFakeAnalysisRepo()
 	repo.err = errors.New("connection refused")
-	h := analysisworker.NewVideoHandler(det, repo, noWaitCoordinator())
+	h := analysisworker.NewVideoHandler(fetcher, det, repo, noWaitCoordinator())
 
 	job, _ := analysisjob.NewVideoAnalysisJob("session-1", "https://example.com/video.mp4")
 	if err := h.Handle(context.Background(), job); err == nil {
@@ -203,7 +295,7 @@ func TestVideoHandler_Handle_RepositoryError(t *testing.T) {
 	}
 }
 
-// fakeAudioFetcher stands in for HTTPAudioFetcher.
+// fakeAudioFetcher stands in for a *analysisworker.SafeURLFetcher.
 type fakeAudioFetcher struct {
 	data   []byte
 	err    error
@@ -267,6 +359,15 @@ func TestAudioHandler_IsPermanent_InvalidAudio(t *testing.T) {
 	}
 }
 
+func TestAudioHandler_IsPermanent_BlockedBySSRFValidation(t *testing.T) {
+	h := analysisworker.NewAudioHandler(&fakeAudioFetcher{}, &fakeAudioAnalyzer{}, newFakeAnalysisRepo(), noWaitCoordinator())
+
+	err := &security.FetchError{Kind: security.FetchErrorBlocked, Message: "blocked by SSRF validation"}
+	if !h.IsPermanent(err) {
+		t.Error("IsPermanent(blocked fetch error) = false, want true")
+	}
+}
+
 // TestVideoAndAudioHandlers_CombinedRisk_VideoFirst proves 7.6.6/7.6.7
 // end to end at the handler level: video completing first, with audio
 // still outstanding, must record only the video score (no risk yet);
@@ -282,7 +383,7 @@ func TestVideoAndAudioHandlers_CombinedRisk_VideoFirst(t *testing.T) {
 	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-order", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: videoJob.CreatedAt})
 	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-order", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusProcessing, CreatedAt: audioJob.CreatedAt})
 
-	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoFetcher{data: []byte("v")}, &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
 	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
 		t.Fatalf("video Handle() error = %v", err)
 	}
@@ -338,7 +439,7 @@ func TestVideoAndAudioHandlers_CombinedRisk_AudioFirst(t *testing.T) {
 	// test above for why this test does this by hand.
 	jobsRepo.MarkCompleted(context.Background(), audioJob.ID)
 
-	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoFetcher{data: []byte("v")}, &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.8, Verdict: "fake"}}, analysisRepo, coordinator)
 	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
 		t.Fatalf("video Handle() error = %v", err)
 	}
@@ -386,7 +487,7 @@ func TestAudioHandler_OnDeadLetter_FinalizesWhenNoResultYet(t *testing.T) {
 	jobsRepo.put(jobsrepo.Job{ID: videoJob.ID, SessionID: "session-audio-dl", Type: string(analysisjob.TypeVideoAnalysis), Status: jobsrepo.StatusCompleted, CreatedAt: videoJob.CreatedAt})
 	jobsRepo.put(jobsrepo.Job{ID: audioJob.ID, SessionID: "session-audio-dl", Type: string(analysisjob.TypeAudioAnalysis), Status: jobsrepo.StatusDeadLetter, CreatedAt: audioJob.CreatedAt})
 
-	videoHandler := analysisworker.NewVideoHandler(&fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.3, Verdict: "real"}}, analysisRepo, coordinator)
+	videoHandler := analysisworker.NewVideoHandler(&fakeVideoFetcher{data: []byte("v")}, &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.3, Verdict: "real"}}, analysisRepo, coordinator)
 	if err := videoHandler.Handle(context.Background(), videoJob); err != nil {
 		t.Fatalf("video Handle() error = %v", err)
 	}
@@ -402,33 +503,57 @@ func TestAudioHandler_OnDeadLetter_FinalizesWhenNoResultYet(t *testing.T) {
 	}
 }
 
-// TestHTTPAudioFetcher_Fetch proves the real fetcher (not a fake) works
-// against a real HTTP server — the one piece of handler.go that isn't
-// "reuse the existing client," so it earns its own live test.
-func TestHTTPAudioFetcher_Fetch(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("real audio bytes"))
-	}))
-	defer srv.Close()
+// fakeURLFetcher stands in for *security.SafeFetcher — SafeURLFetcher
+// is a thin adapter, and internal/security's own tests already
+// exhaustively cover SafeFetcher's real SSRF/timeout/redirect/size
+// behavior, so these tests only need to prove the adapter itself:
+// bytes come back on success, errors (and the options passed through)
+// are propagated correctly.
+type fakeURLFetcher struct {
+	response *security.Response
+	err      error
+	gotURL   string
+	gotOpts  security.FetchOptions
+}
 
-	fetcher := analysisworker.NewHTTPAudioFetcher()
-	data, err := fetcher.Fetch(context.Background(), srv.URL)
+func (f *fakeURLFetcher) Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error) {
+	f.gotURL = rawURL
+	f.gotOpts = opts
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.response, nil
+}
+
+func TestSafeURLFetcher_Fetch_Success(t *testing.T) {
+	fake := &fakeURLFetcher{response: &security.Response{Body: []byte("real audio bytes")}}
+	fetcher := analysisworker.NewSafeURLFetcher(fake, analysisworker.MaxAudioFetchBytes, []string{"audio/"})
+
+	data, err := fetcher.Fetch(context.Background(), "https://example.com/audio.wav")
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
 	if string(data) != "real audio bytes" {
 		t.Errorf("Fetch() = %q, want %q", data, "real audio bytes")
 	}
+	if fake.gotURL != "https://example.com/audio.wav" {
+		t.Errorf("underlying fetcher received URL %q, want %q", fake.gotURL, "https://example.com/audio.wav")
+	}
+	if fake.gotOpts.MaxBytes != analysisworker.MaxAudioFetchBytes {
+		t.Errorf("MaxBytes passed through = %d, want %d", fake.gotOpts.MaxBytes, analysisworker.MaxAudioFetchBytes)
+	}
+	if len(fake.gotOpts.AllowedContentTypes) != 1 || fake.gotOpts.AllowedContentTypes[0] != "audio/" {
+		t.Errorf("AllowedContentTypes passed through = %v, want [audio/]", fake.gotOpts.AllowedContentTypes)
+	}
 }
 
-func TestHTTPAudioFetcher_Fetch_NotFound(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
+func TestSafeURLFetcher_Fetch_PropagatesError(t *testing.T) {
+	wantErr := &security.FetchError{Kind: security.FetchErrorBlocked, Message: "blocked by SSRF validation"}
+	fake := &fakeURLFetcher{err: wantErr}
+	fetcher := analysisworker.NewSafeURLFetcher(fake, analysisworker.MaxAudioFetchBytes, nil)
 
-	fetcher := analysisworker.NewHTTPAudioFetcher()
-	if _, err := fetcher.Fetch(context.Background(), srv.URL); err == nil {
-		t.Fatal("Fetch() error = nil, want an error for a 404 response")
+	_, err := fetcher.Fetch(context.Background(), "http://127.0.0.1/audio.wav")
+	if !errors.Is(err, wantErr) {
+		t.Errorf("Fetch() error = %v, want %v", err, wantErr)
 	}
 }

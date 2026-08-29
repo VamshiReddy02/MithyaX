@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -17,7 +18,23 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
 	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
+
+// permissiveResolver treats every hostname as resolving to a fixed
+// public IP — these handler tests aren't about SSRF validation itself
+// (see internal/security's own exhaustive tests for that), they just
+// need NewCreateAnalysisJob's mandatory video_url/audio_url check
+// (7.7.5) to pass for whatever example.com-style URL a case uses.
+type permissiveResolver struct{}
+
+func (permissiveResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+}
+
+func permissiveValidator() *security.Validator {
+	return security.NewValidator(security.WithResolver(permissiveResolver{}))
+}
 
 // fakeAnalysisQueue is a minimal in-memory queue.Queue for
 // handler-level tests of POST /api/v1/analysis — these only care that
@@ -131,7 +148,7 @@ func testLogger() *slog.Logger {
 func newCreateAnalysisRouter(videoQueue, audioQueue queue.Queue, jobs jobsrepo.Repository) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.POST("/api/v1/analysis", handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobs, testLogger()))
+	router.POST("/api/v1/analysis", handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobs, permissiveValidator(), testLogger()))
 	router.GET("/api/v1/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobs))
 	return router
 }

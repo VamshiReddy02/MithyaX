@@ -59,9 +59,12 @@ func classify(score float64, ok bool, t Thresholds) Verdict {
 
 // buildReasons explains what drove (or limited) the assessment: which
 // signals individually crossed the fake threshold, and which signals
-// were unavailable and why.
+// were unavailable and why. Always non-nil, even when empty (a
+// low-scoring session with every signal present has nothing to
+// report) — analysis_results.risk_reasons is NOT NULL, and a nil
+// slice serializes to SQL NULL, not an empty array.
 func buildReasons(sig Signals, signalThreshold float64) []string {
-	var reasons []string
+	reasons := []string{}
 
 	if sig.AudioOK && sig.Audio >= signalThreshold {
 		reasons = append(reasons, "Audio signal indicates likely synthetic speech")

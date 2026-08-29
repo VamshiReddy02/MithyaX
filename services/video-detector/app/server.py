@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import cv2
 import httpx
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, HttpUrl
 
 from app.diagnostic import analyze_video, extract_face, sample_frame_metadata
@@ -95,19 +95,48 @@ def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
 
     with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
         _download_video(video_url, Path(tmp.name))
+        report = _run_analysis(tmp.name)
 
-        try:
-            report = analyze_video(
-                tmp.name,
-                models.detector,
-                models.face_detector,
-                models.embedding_model,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _build_response(video_name, report)
 
+
+@app.post("/analyze-upload", response_model=AnalyzeResponse)
+async def analyze_upload(video: UploadFile = File(...)) -> AnalyzeResponse:
+    """Analyzes an uploaded video file directly, rather than a URL this
+    service would otherwise have to fetch itself. The Go gateway's
+    worker uses this path exclusively (see internal/analysisworker):
+    it downloads the video through its own SSRF-safe fetcher
+    (internal/security.SafeFetcher) and uploads the resulting bytes
+    here, so this service never makes an outbound request to a
+    client-supplied URL for this flow. /analyze (above) still exists
+    for the gateway's other, older pipelines that haven't migrated to
+    that model yet.
+    """
+    data = await video.read()
+    suffix = Path(video.filename or "").suffix or ".mp4"
+    video_name = video.filename or "video"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+        Path(tmp.name).write_bytes(data)
+        report = _run_analysis(tmp.name)
+
+    return _build_response(video_name, report)
+
+
+def _run_analysis(video_path: str) -> dict:
+    try:
+        return analyze_video(
+            video_path,
+            models.detector,
+            models.face_detector,
+            models.embedding_model,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _build_response(video_name: str, report: dict) -> AnalyzeResponse:
     fake_score = report["fake_score"]
-
     sampled_frames = sample_frame_metadata(report["frame_metadata"])
 
     return AnalyzeResponse(

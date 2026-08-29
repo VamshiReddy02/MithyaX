@@ -25,6 +25,7 @@ import (
 	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
 	sessionrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/sessions"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
 	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
 	"github.com/vamshireddy02/mithyax/gateway/internal/websocket"
@@ -134,9 +135,23 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		logger.Info("recovered stale audio jobs from a previous run", slog.Int("count", n))
 	}
 
+	// SSRF protection (7.7.4/7.7.5): one Validator shared by the API
+	// boundary (POST /api/v1/analysis, below) and every worker fetch —
+	// see internal/security's package doc for why both matter. Both
+	// VideoHandler and AudioHandler now fetch their own bytes through a
+	// SafeFetcher-backed SafeURLFetcher rather than handing a URL to a
+	// Python service to fetch itself: the video-detector's
+	// /analyze-upload endpoint (as opposed to its older, still-present
+	// /analyze) takes bytes precisely so this worker is the only thing
+	// that ever makes an outbound request to a client-supplied URL.
+	urlValidator := security.NewValidator()
+	safeFetcher := security.NewSafeFetcher(urlValidator, security.Config{})
+
 	completionCoordinator := analysisworker.NewCoordinator(jobsRepo)
-	videoHandler := analysisworker.NewVideoHandler(detectorClient, analysisRepo, completionCoordinator)
-	audioHandler := analysisworker.NewAudioHandler(analysisworker.NewHTTPAudioFetcher(), audioClient, analysisRepo, completionCoordinator)
+	videoFetcher := analysisworker.NewSafeURLFetcher(safeFetcher, analysisworker.MaxVideoFetchBytes, []string{"video/"})
+	videoHandler := analysisworker.NewVideoHandler(videoFetcher, detectorClient, analysisRepo, completionCoordinator)
+	audioFetcher := analysisworker.NewSafeURLFetcher(safeFetcher, analysisworker.MaxAudioFetchBytes, []string{"audio/"})
+	audioHandler := analysisworker.NewAudioHandler(audioFetcher, audioClient, analysisRepo, completionCoordinator)
 	videoWorkers := analysisworker.NewPool(videoQueue, videoHandler, jobsRepo, cfg.VideoWorkers, logger)
 	audioWorkers := analysisworker.NewPool(audioQueue, audioHandler, jobsRepo, cfg.AudioWorkers, logger)
 
@@ -190,7 +205,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	// POST /analysis gets a stricter limit layered on top of the
 	// group's default 60/min — it creates async jobs that go on to call
 	// a Python detector, so it's worth capping harder than a cheap GET.
-	v1.POST("/analysis", ratelimit.Middleware(limiter, "analysis-create", analysisCreateRateLimit, logger), handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, logger))
+	v1.POST("/analysis", ratelimit.Middleware(limiter, "analysis-create", analysisCreateRateLimit, logger), handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, urlValidator, logger))
 	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))
 
 	return &Server{

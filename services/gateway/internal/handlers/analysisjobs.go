@@ -11,6 +11,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisjob"
 	"github.com/vamshireddy02/mithyax/gateway/internal/queue"
 	jobsrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/jobs"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
 
 // createAnalysisRequest is the POST /api/v1/analysis body (7.6.1):
@@ -52,7 +53,7 @@ type createAnalysisResponse struct {
 // never get a 404 for a job_id this handler already returned. If the
 // enqueue then fails, the job is marked dead_letter rather than left
 // stuck at "queued" forever with nothing ever going to pick it up.
-func NewCreateAnalysisJob(videoQueue, audioQueue queue.Queue, jobs jobsrepo.Repository, logger *slog.Logger) gin.HandlerFunc {
+func NewCreateAnalysisJob(videoQueue, audioQueue queue.Queue, jobs jobsrepo.Repository, urlValidator *security.Validator, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req createAnalysisRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -66,6 +67,26 @@ func NewCreateAnalysisJob(videoQueue, audioQueue queue.Queue, jobs jobsrepo.Repo
 		if req.VideoURL == "" && req.AudioURL == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of video_url or audio_url is required"})
 			return
+		}
+
+		// SSRF protection, layer 1 of 2 (7.7.5): reject an obviously
+		// unsafe URL before it's ever persisted or enqueued. This alone
+		// isn't sufficient — a job can sit in Redis for a long time
+		// before a worker picks it up, and DNS can change in the
+		// meantime — so the worker validates again immediately before
+		// fetching (see internal/analysisworker's Handler
+		// implementations). Both checks share this same Validator.
+		if req.VideoURL != "" {
+			if err := urlValidator.ValidateURL(req.VideoURL); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "video_url is not allowed: " + err.Error()})
+				return
+			}
+		}
+		if req.AudioURL != "" {
+			if err := urlValidator.ValidateURL(req.AudioURL); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "audio_url is not allowed: " + err.Error()})
+				return
+			}
 		}
 
 		var summaries []analysisJobSummary

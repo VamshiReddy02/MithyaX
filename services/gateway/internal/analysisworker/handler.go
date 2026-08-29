@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"net/url"
+	"path"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/analysisjob"
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	analysisrepo "github.com/vamshireddy02/mithyax/gateway/internal/repository/analysis"
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
 
 // Handler processes one dequeued AnalysisJob's actual work — calling
@@ -106,26 +107,109 @@ func finalizeOnDeadLetter(ctx context.Context, coordinator *Coordinator, repo an
 	return nil
 }
 
-// VideoAnalyzer analyzes a video by URL. *detector.Client implements it
-// via Analyze — the existing client, reused as-is (see package doc).
-type VideoAnalyzer interface {
-	Analyze(ctx context.Context, videoURL string) (*detector.Result, error)
+// URLFetcher fetches the bytes referenced by an AnalysisJob's URL
+// payload (video_url or audio_url) — used by both VideoHandler and
+// AudioHandler (7.7.5): as of this phase both modalities follow the
+// identical shape "SSRF-safe fetch, then hand bytes to the Python
+// detector." SafeURLFetcher is the real implementation.
+type URLFetcher interface {
+	Fetch(ctx context.Context, rawURL string) ([]byte, error)
 }
 
-// VideoHandler is the Handler for VIDEO_ANALYSIS jobs (7.5.2): the
-// video-detector fetches the referenced video itself (Analyze takes a
-// URL, not bytes — nothing to download here), so this only calls it
-// and upserts the result.
+// MaxVideoFetchBytes and MaxAudioFetchBytes bound how much a
+// SafeURLFetcher will download for each modality — same class of limit
+// /api/v1/analyze-audio already applies to an uploaded file (see
+// internal/handlers/analyzeaudio.go), applied here to one fetched by
+// reference instead. Exported for httpserver.New to wire into
+// NewSafeURLFetcher. "Eventually configuration rather than hardcoded
+// values" per 7.7.5 — not yet needed until real usage says these
+// defaults are wrong.
+const (
+	MaxVideoFetchBytes = 100 << 20 // 100MiB
+	MaxAudioFetchBytes = 25 << 20  // 25MiB
+)
+
+// urlFetcher is the subset of *security.SafeFetcher's API SafeURLFetcher
+// actually needs, narrowed to an interface — the same reason
+// VideoAnalyzer/AudioAnalyzer below are interfaces rather than concrete
+// clients — so tests can substitute a fake instead of needing a real
+// network fetch; internal/security's own tests already exhaustively
+// cover *security.SafeFetcher's real behavior.
+type urlFetcher interface {
+	Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error)
+}
+
+// SafeURLFetcher is the real URLFetcher (7.7.5): every fetch goes
+// through security.SafeFetcher, which validates the URL (a fresh DNS
+// lookup, not just whatever the API checked when the job was created —
+// DNS can change while a job sits in Redis), pins the connection to
+// the address it just validated, follows redirects only after
+// validating each target the same way, and bounds both response size
+// and Content-Type.
+type SafeURLFetcher struct {
+	fetcher      urlFetcher
+	maxBytes     int64
+	contentTypes []string
+}
+
+// NewSafeURLFetcher builds a SafeURLFetcher backed by fetcher — in
+// production, always a real *security.SafeFetcher, which satisfies
+// urlFetcher structurally — bounding each fetch to maxBytes and, if
+// allowedContentTypes is non-empty, rejecting any other Content-Type
+// (see security.FetchOptions).
+func NewSafeURLFetcher(fetcher urlFetcher, maxBytes int64, allowedContentTypes []string) *SafeURLFetcher {
+	return &SafeURLFetcher{fetcher: fetcher, maxBytes: maxBytes, contentTypes: allowedContentTypes}
+}
+
+func (f *SafeURLFetcher) Fetch(ctx context.Context, rawURL string) ([]byte, error) {
+	resp, err := f.fetcher.Fetch(ctx, rawURL, security.FetchOptions{MaxBytes: f.maxBytes, AllowedContentTypes: f.contentTypes})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// isFetchPermanent classifies a URLFetcher failure the way both
+// Handler implementations need — blocked by SSRF validation, too many
+// redirects, response too large, wrong content type, or an
+// unacceptable (4xx vs. 5xx) status already know their own permanence;
+// see FetchError.IsPermanent. A non-FetchError (e.g. a payload decode
+// failure that happened before any fetch was attempted) isn't this
+// function's concern — callers check that separately.
+func isFetchPermanent(err error) bool {
+	var fetchErr *security.FetchError
+	return errors.As(err, &fetchErr) && fetchErr.IsPermanent()
+}
+
+// VideoAnalyzer analyzes raw video bytes. *detector.Client implements
+// it via AnalyzeBytes — the existing client, reused as-is.
+type VideoAnalyzer interface {
+	AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error)
+}
+
+// VideoHandler is the Handler for VIDEO_ANALYSIS jobs (7.5.2): fetch
+// the referenced video through a SafeURLFetcher (7.7.5 — SSRF-safe,
+// size-bounded, redirect-validated, DNS-rebinding-safe; see
+// internal/security's package doc), hand the bytes to the
+// video-detector, upsert the result.
+//
+// Before 7.7.5 this handed video_url straight to the video-detector,
+// which fetched it in its own process — completely outside this
+// package's SSRF protection. Fetching the bytes here instead, exactly
+// like AudioHandler already did, closes that gap: the video-detector
+// now never makes an outbound request to a client-supplied URL at all
+// (see its /analyze-upload endpoint).
 type VideoHandler struct {
+	fetcher     URLFetcher
 	detector    VideoAnalyzer
 	repo        analysisrepo.Repository
 	coordinator *Coordinator
 }
 
-// NewVideoHandler builds a VideoHandler backed by detectorClient (the
-// existing internal/detector.Client), repo, and coordinator (7.6.6).
-func NewVideoHandler(detectorClient VideoAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *VideoHandler {
-	return &VideoHandler{detector: detectorClient, repo: repo, coordinator: coordinator}
+// NewVideoHandler builds a VideoHandler backed by fetcher, detectorClient
+// (the existing internal/detector.Client), repo, and coordinator (7.6.6).
+func NewVideoHandler(fetcher URLFetcher, detectorClient VideoAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *VideoHandler {
+	return &VideoHandler{fetcher: fetcher, detector: detectorClient, repo: repo, coordinator: coordinator}
 }
 
 func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) error {
@@ -134,7 +218,12 @@ func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 		return fmt.Errorf("decode video payload: %w", err)
 	}
 
-	result, err := h.detector.Analyze(ctx, payload.VideoURL)
+	data, err := h.fetcher.Fetch(ctx, payload.VideoURL)
+	if err != nil {
+		return fmt.Errorf("fetch video: %w", err)
+	}
+
+	result, err := h.detector.AnalyzeBytes(ctx, filenameFromURL(payload.VideoURL), data)
 	if err != nil {
 		return fmt.Errorf("video-detector: %w", err)
 	}
@@ -150,68 +239,34 @@ func (h *VideoHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 	return nil
 }
 
+// filenameFromURL extracts a file name (with extension) from a URL's
+// path, the same way the video-detector's own /analyze endpoint infers
+// one from video_url — preserved here so /analyze-upload sees the same
+// container-format hint (via the file extension) it always would have
+// from the URL itself, e.g. clip.mov rather than an assumed clip.mp4.
+func filenameFromURL(rawURL string) string {
+	const fallback = "video.mp4"
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fallback
+	}
+	name := path.Base(parsed.Path)
+	if name == "" || name == "." || name == "/" {
+		return fallback
+	}
+	return name
+}
+
 func (h *VideoHandler) IsPermanent(err error) bool {
 	var detErr *detector.Error
-	return errors.As(err, &detErr) && detErr.Kind == detector.KindInvalidVideo
+	if errors.As(err, &detErr) && detErr.Kind == detector.KindInvalidVideo {
+		return true
+	}
+	return isFetchPermanent(err)
 }
 
 func (h *VideoHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error {
 	return finalizeOnDeadLetter(ctx, h.coordinator, h.repo, job.SessionID, analysisjob.TypeVideoAnalysis)
-}
-
-// AudioFetcher fetches the bytes referenced by an AUDIO_ANALYSIS job's
-// URL. A separate seam from AudioAnalyzer (below) because
-// internal/audio.Client only ever accepts raw bytes (see its own doc) —
-// unlike the video-detector, it has no URL-fetching mode of its own, so
-// something has to fetch the reference before handing it to the
-// existing client. This is deliberately not "another Python client":
-// it's a plain HTTP GET.
-type AudioFetcher interface {
-	Fetch(ctx context.Context, audioURL string) ([]byte, error)
-}
-
-// maxAudioFetchBytes bounds a fetched audio file the same way
-// /api/v1/analyze-audio bounds an uploaded one (see
-// internal/handlers/analyzeaudio.go) — same class of data, arriving by
-// reference instead of upload.
-const maxAudioFetchBytes = 25 << 20 // 25MiB
-
-// HTTPAudioFetcher is the real AudioFetcher: a plain, size-bounded HTTP GET.
-type HTTPAudioFetcher struct {
-	client *http.Client
-}
-
-// NewHTTPAudioFetcher builds an HTTPAudioFetcher using http.DefaultClient's
-// transport settings but its own *http.Client, so per-call timeouts
-// (via ctx) aren't shared with anything else in the process.
-func NewHTTPAudioFetcher() *HTTPAudioFetcher {
-	return &HTTPAudioFetcher{client: &http.Client{}}
-}
-
-func (f *HTTPAudioFetcher) Fetch(ctx context.Context, audioURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, audioURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch audio: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch audio: unexpected status %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAudioFetchBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read audio body: %w", err)
-	}
-	if len(data) > maxAudioFetchBytes {
-		return nil, fmt.Errorf("audio at %s exceeds %d bytes", audioURL, maxAudioFetchBytes)
-	}
-	return data, nil
 }
 
 // AudioAnalyzer analyzes raw audio bytes. *audio.Client implements it
@@ -221,10 +276,10 @@ type AudioAnalyzer interface {
 }
 
 // AudioHandler is the Handler for AUDIO_ANALYSIS jobs (7.5.3): fetch
-// the referenced audio, hand the bytes to the existing audio-detector
-// client, upsert the result.
+// the referenced audio through a SafeURLFetcher (7.7.5), hand the
+// bytes to the existing audio-detector client, upsert the result.
 type AudioHandler struct {
-	fetcher     AudioFetcher
+	fetcher     URLFetcher
 	detector    AudioAnalyzer
 	repo        analysisrepo.Repository
 	coordinator *Coordinator
@@ -232,7 +287,7 @@ type AudioHandler struct {
 
 // NewAudioHandler builds an AudioHandler backed by fetcher, detectorClient
 // (the existing internal/audio.Client), repo, and coordinator (7.6.6).
-func NewAudioHandler(fetcher AudioFetcher, detectorClient AudioAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *AudioHandler {
+func NewAudioHandler(fetcher URLFetcher, detectorClient AudioAnalyzer, repo analysisrepo.Repository, coordinator *Coordinator) *AudioHandler {
 	return &AudioHandler{fetcher: fetcher, detector: detectorClient, repo: repo, coordinator: coordinator}
 }
 
@@ -265,7 +320,10 @@ func (h *AudioHandler) Handle(ctx context.Context, job analysisjob.AnalysisJob) 
 
 func (h *AudioHandler) IsPermanent(err error) bool {
 	var audErr *audio.Error
-	return errors.As(err, &audErr) && audErr.Kind == audio.KindInvalidAudio
+	if errors.As(err, &audErr) && audErr.Kind == audio.KindInvalidAudio {
+		return true
+	}
+	return isFetchPermanent(err)
 }
 
 func (h *AudioHandler) OnDeadLetter(ctx context.Context, job analysisjob.AnalysisJob) error {

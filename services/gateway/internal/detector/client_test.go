@@ -57,6 +57,75 @@ func TestAnalyze_Success(t *testing.T) {
 	}
 }
 
+// TestAnalyzeBytes_Success proves AnalyzeBytes (7.7.5) uploads the
+// given bytes as a multipart file to /analyze-upload — the video-
+// detector's endpoint for a worker that fetched the video itself
+// rather than handing over a URL — and decodes the same response
+// shape Analyze does.
+func TestAnalyzeBytes_Success(t *testing.T) {
+	want := detector.Result{
+		Video:           "clip.mp4",
+		Frames:          120,
+		FacesDetected:   100,
+		FakeScore:       0.83,
+		Verdict:         "fake",
+		EmbeddingFrames: 100,
+	}
+
+	var gotFilename string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/analyze-upload" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm() error = %v", err)
+		}
+		file, header, err := r.FormFile("video")
+		if err != nil {
+			t.Fatalf("FormFile() error = %v", err)
+		}
+		defer file.Close()
+		gotFilename = header.Filename
+		gotBody, _ = io.ReadAll(file)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(want)
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	got, err := client.AnalyzeBytes(context.Background(), "clip.mp4", []byte("fake-video-bytes"))
+	if err != nil {
+		t.Fatalf("AnalyzeBytes() error = %v", err)
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("AnalyzeBytes() = %+v, want %+v", *got, want)
+	}
+	if gotFilename != "clip.mp4" {
+		t.Errorf("uploaded filename = %q, want %q", gotFilename, "clip.mp4")
+	}
+	if string(gotBody) != "fake-video-bytes" {
+		t.Errorf("uploaded body = %q, want %q", gotBody, "fake-video-bytes")
+	}
+}
+
+func TestAnalyzeBytes_InvalidVideo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(map[string]string{"detail": "could not decode video"})
+	}))
+	defer server.Close()
+
+	client := detector.NewClient(server.URL, time.Second)
+	_, err := client.AnalyzeBytes(context.Background(), "clip.mp4", []byte("garbage"))
+
+	var detErr *detector.Error
+	if !errors.As(err, &detErr) || detErr.Kind != detector.KindInvalidVideo {
+		t.Fatalf("AnalyzeBytes() error = %v, want KindInvalidVideo", err)
+	}
+}
+
 // TestAnalyze_DecodesFrameMetadata proves the client correctly decodes
 // the video-detector's actual /analyze wire format for frame_metadata:
 // a nested "face" object (or null) rather than flat fields, mirroring

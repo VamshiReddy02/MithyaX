@@ -211,6 +211,15 @@ func TestEngine_AssessSignals(t *testing.T) {
 			if !equalReasons(got.Reasons, tt.wantReasons) {
 				t.Errorf("Reasons = %v, want %v", got.Reasons, tt.wantReasons)
 			}
+			// Reasons must always be non-nil, even when empty: it
+			// persists to a NOT NULL Postgres column (analysis_results.
+			// risk_reasons), and a nil slice serializes to SQL NULL, not
+			// an empty array — a real bug this test caught live (a
+			// low-scoring session with no reasons to report crashed
+			// FinalizeRisk's UPDATE with a not-null constraint violation).
+			if got.Reasons == nil {
+				t.Error("Reasons = nil, want a non-nil (possibly empty) slice")
+			}
 		})
 	}
 }

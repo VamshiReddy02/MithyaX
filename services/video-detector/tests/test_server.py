@@ -118,6 +118,51 @@ def test_analyze_real_video(client, video_server):
             assert entry["face"] is None
 
 
+def test_analyze_upload_missing_file(client):
+    response = client.post("/analyze-upload")
+
+    assert response.status_code == 422
+
+
+def test_analyze_upload_garbage_bytes(client):
+    response = client.post(
+        "/analyze-upload",
+        files={"video": ("not-a-video.mp4", b"not actually a video", "video/mp4")},
+    )
+
+    assert response.status_code == 422
+
+
+def test_analyze_upload_real_video(client):
+    """The Go gateway's async worker (internal/analysisworker) uploads
+    bytes it already fetched itself, rather than handing this service a
+    URL to fetch on its own — see analyze_upload's own docstring for
+    why. This proves that path produces the same shape of result
+    /analyze does for the same file, just delivered differently.
+    """
+    videos = sorted(SAMPLES_DIR.glob("*.mp4"))
+
+    if not videos:
+        pytest.skip("no sample videos found")
+
+    video_path = videos[0]
+
+    with video_path.open("rb") as f:
+        response = client.post(
+            "/analyze-upload",
+            files={"video": (video_path.name, f, "video/mp4")},
+        )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["video"] == video_path.name
+    assert body["frames"] > 0
+    assert 0.0 <= body["fake_score"] <= 1.0
+    assert body["verdict"] in {"real", "fake"}
+
+
 def _first_frame_jpeg(video_path: Path) -> bytes:
     cap = cv2.VideoCapture(str(video_path))
     ok, frame = cap.read()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -425,5 +426,99 @@ func TestServer_RateLimitWiring(t *testing.T) {
 	defer otherRouteResp.Body.Close()
 	if otherRouteResp.StatusCode == http.StatusTooManyRequests {
 		t.Error("GET /api/v1/analysis/jobs/:id status = 429 — exhausting POST /api/v1/analysis's own limit must not affect the default scope")
+	}
+}
+
+// TestServer_SSRFProtection_CannotBypass is 7.7.5's end-to-end proof,
+// exercised through the real POST /api/v1/analysis handler (the actual
+// API boundary a client talks to), that a malicious video_url/audio_url
+// never gets anywhere close to a worker actually fetching it: every
+// case here is rejected with 400 before a job is ever persisted or
+// enqueued — the request never reaches Redis, let alone a worker or a
+// detector. This is deliberately black-box (no internal hook into the
+// validator or queue) to prove the property from a real attacker's own
+// vantage point: submit the request, see what comes back.
+//
+// This complements, rather than replaces, two more targeted tests
+// elsewhere: internal/analysisworker's
+// TestVideoHandler_Handle_BlockedBySSRFValidation proves the *second*
+// gate (the worker's own revalidation, for a URL that was safe when
+// the job was created but isn't by the time a worker picks it up), and
+// internal/security's TestFetch_RedirectToPrivateIP_Blocked proves
+// SafeFetcher itself refuses to follow a redirect into a private
+// network — something no amount of validating the original URL alone
+// (what this API-boundary check does) could ever catch, which is
+// exactly why both layers exist.
+func TestServer_SSRFProtection_CannotBypass(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                 "0",
+		Environment:          "test",
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          1,
+		WorkerQueueSize:      1,
+		RedisURL:             "redis://" + mr.Addr(),
+		JobTTL:               time.Hour,
+		AuthToken:            testAuthToken,
+		AdminAuthToken:       testAdminAuthToken,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	maliciousURLs := []string{
+		`http://127.0.0.1:5432/`,         // the gateway's own database port
+		`http://localhost:8080/`,         // the gateway itself, by name
+		`http://169.254.169.254/latest/`, // cloud metadata endpoint
+		`http://10.0.0.5/internal`,       // RFC 1918 private range
+		`http://0x7f000001/`,             // 127.0.0.1, hex-encoded (7.7.4's alternate-form check)
+		`http://[::1]/`,                  // IPv6 loopback
+		`file:///etc/passwd`,             // disallowed scheme
+	}
+
+	for _, malicious := range maliciousURLs {
+		t.Run(malicious, func(t *testing.T) {
+			body := fmt.Sprintf(`{"session_id":"session-1","video_url":%q}`, malicious)
+			resp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(body))
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("POST /api/v1/analysis with video_url=%q status = %d, want %d — this must never become a job", malicious, resp.StatusCode, http.StatusBadRequest)
+			}
+
+			// Confirm no job actually made it onto the Redis queue —
+			// not just that the HTTP response looked like a rejection.
+			if !mr.Exists("mithyax:jobs:video_analysis") {
+				return // nothing was ever enqueued at all, which is the expected case
+			}
+			entries, err := mr.List("mithyax:jobs:video_analysis")
+			if err != nil {
+				t.Fatalf("mr.List() error = %v", err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("video_url=%q: %d entries found on the video analysis queue, want 0 — nothing should have been enqueued", malicious, len(entries))
+			}
+		})
+	}
+
+	// The same protection applies to audio_url.
+	body := `{"session_id":"session-1","audio_url":"http://169.254.169.254/latest/meta-data"}`
+	resp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /api/v1/analysis with a blocked audio_url status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }

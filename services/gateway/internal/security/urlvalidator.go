@@ -122,40 +122,90 @@ func (v *Validator) ValidateURL(rawURL string) error {
 // (see the package doc), not just once up front at the API boundary:
 // a job can sit in a queue for hours between the two.
 func (v *Validator) ValidateURLContext(ctx context.Context, rawURL string) error {
+	_, err := v.resolveContext(ctx, rawURL)
+	return err
+}
+
+// ResolvedTarget is a URL that has passed every SSRF check, together
+// with the one specific, already-validated IP address SafeFetcher
+// pins its actual connection to (see resolveContext's doc for why
+// pinning — not just validating and then letting something else
+// resolve again — is what closes the DNS-rebinding gap).
+type ResolvedTarget struct {
+	// URL is the parsed, original URL — still carrying the hostname
+	// (not the IP), so a caller can use it for the Host header and TLS
+	// SNI while dialing IP directly.
+	URL *url.URL
+	// IP is one publicly-routable address host resolved to, safe to
+	// connect to right now.
+	IP net.IP
+}
+
+// ResolveContext validates rawURL exactly like ValidateURLContext, and
+// additionally returns the specific IP that validation just proved
+// safe — see SafeFetcher, the only caller that needs the IP itself
+// rather than a pass/fail answer.
+func (v *Validator) ResolveContext(ctx context.Context, rawURL string) (*ResolvedTarget, error) {
+	return v.resolveContext(ctx, rawURL)
+}
+
+// resolveContext is ValidateURLContext and ResolveContext's shared
+// implementation:
+//
+//	Parse URL -> validate scheme -> validate hostname -> DNS resolution -> check every IP -> allowed?
+//
+// A literal IP host is checked directly. A DNS name is resolved via
+// the configured Resolver, and every address it comes back with — not
+// just the first — must be publicly routable, which is what defeats
+// DNS rebinding: a name can resolve to more than one address, and an
+// attacker only needs one of them to be internal. The first public
+// answer is what a caller needing an actual IP (ResolveContext) gets
+// back to connect to.
+//
+// This check is only as current as the DNS answer used to produce it.
+// A name validated here as public can resolve differently by the time
+// something actually fetches it — which is exactly why this same
+// Validator must be called again immediately before the fetch itself
+// (see the package doc), not just once up front at the API boundary:
+// a job can sit in a queue for hours between the two. SafeFetcher goes
+// one step further still: it doesn't just re-validate and then trust
+// a second, separate DNS resolution to agree — it pins the connection
+// to the exact address ResolveContext already checked.
+func (v *Validator) resolveContext(ctx context.Context, rawURL string) (*ResolvedTarget, error) {
 	parsed, err := parseURL(rawURL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	host := strings.TrimSuffix(parsed.Hostname(), ".")
 	if host == "" {
-		return fmt.Errorf("%w: no host", ErrInvalidURL)
+		return nil, fmt.Errorf("%w: no host", ErrInvalidURL)
 	}
 
 	if ip := literalIP(host); ip != nil {
-		if !isPublicIP(ip) {
-			return fmt.Errorf("%w: %s", ErrPrivateAddress, ip)
+		if !isPublicIPFunc(ip) {
+			return nil, fmt.Errorf("%w: %s", ErrPrivateAddress, ip)
 		}
-		return nil
+		return &ResolvedTarget{URL: parsed, IP: ip}, nil
 	}
 
 	if strings.EqualFold(host, "localhost") {
-		return fmt.Errorf("%w: localhost", ErrPrivateAddress)
+		return nil, fmt.Errorf("%w: localhost", ErrPrivateAddress)
 	}
 
 	addrs, err := v.resolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrUnresolvableHost, host, err)
+		return nil, fmt.Errorf("%w: %s: %v", ErrUnresolvableHost, host, err)
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("%w: %s", ErrUnresolvableHost, host)
+		return nil, fmt.Errorf("%w: %s", ErrUnresolvableHost, host)
 	}
 	for _, addr := range addrs {
-		if !isPublicIP(addr.IP) {
-			return fmt.Errorf("%w: %s resolves to %s", ErrPrivateAddress, host, addr.IP)
+		if !isPublicIPFunc(addr.IP) {
+			return nil, fmt.Errorf("%w: %s resolves to %s", ErrPrivateAddress, host, addr.IP)
 		}
 	}
-	return nil
+	return &ResolvedTarget{URL: parsed, IP: addrs[0].IP}, nil
 }
 
 // parseURL parses rawURL and validates everything checkable without
@@ -256,6 +306,15 @@ func parseAlternateIPv4(host string) (net.IP, bool) {
 // IPv6 unique local addresses in one call; IsLinkLocalUnicast covers
 // 169.254.0.0/16 (notably the cloud metadata endpoint at
 // 169.254.169.254) and fe80::/10; the rest are self-explanatory.
+// isPublicIPFunc indirects every call to isPublicIP so
+// safefetcher_test.go (a white-box, package-internal test file) can
+// substitute a permissive check for loopback only, letting its tests
+// exercise real httptest.Server instances (which always bind to
+// loopback) through the actual Fetch pipeline. Production code always
+// runs the real isPublicIP; nothing outside a test ever reassigns
+// this.
+var isPublicIPFunc = isPublicIP
+
 func isPublicIP(ip net.IP) bool {
 	if ip == nil {
 		return false
