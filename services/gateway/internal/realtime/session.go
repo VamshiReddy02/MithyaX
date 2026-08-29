@@ -411,24 +411,12 @@ func (s *Session) riskUpdateLocked() OutMessage {
 	return riskUpdateMessage(s.riskEngine.AssessSignals(s.signalsLocked()))
 }
 
-// FinalResult is everything worth persisting once a session ends: the
-// risk Assessment (which already carries the raw video/audio/temporal
-// scores via its Signals field) plus each modality's own verdict string
-// — the label that specific detector call returned, which Assessment's
-// SignalScores doesn't carry since the risk engine only cares about the
-// numeric score, not the modality's own real/fake label.
 type FinalResult struct {
 	Assessment   risk.Assessment
 	VideoVerdict string
 	AudioVerdict string
 }
 
-// FinalResult recomputes the risk assessment from whatever signals this
-// session ever gathered, alongside the last video/audio verdict strings
-// reported to the client. Safe to call after End(): the underlying
-// fields are set only by worker goroutines, all of which have exited by
-// the time End() returns. Used to persist a session's final result once
-// it ends (see internal/repository/sessions, internal/repository/analysis).
 func (s *Session) FinalResult() FinalResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
