@@ -50,6 +50,22 @@ const (
 	analysisCreateRateLimit = 10
 )
 
+// Request body size ceilings (7.7.6). maxRequestBodyBytes is a
+// generous, whole-API safety net against memory exhaustion from a
+// pathologically large body on any route — well above the largest
+// legitimate upload today (analyze-audio's own 25MiB check, see
+// internal/handlers/analyzeaudio.go), so it never interferes with
+// real traffic. maxJSONRequestBodyBytes is layered on top of that,
+// tighter, for routes that only ever expect a small JSON object — a
+// session_id and up to two URLs has no business needing more than a
+// few KB, so anything past this is already suspicious regardless of
+// what SafeFetcher or the URL-length check further down would
+// eventually catch.
+const (
+	maxRequestBodyBytes     = 64 << 20 // 64MiB
+	maxJSONRequestBodyBytes = 16 << 10 // 16KiB
+)
+
 // Server bundles the HTTP server with the background job pools (and the
 // Redis and PostgreSQL clients they depend on) so callers can shut all
 // of it down together.
@@ -90,7 +106,10 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	router := gin.New()
-	router.Use(middleware.Logging(logger), middleware.CORS(), gin.Recovery())
+	// MaxBodyBytes runs first, before anything else even starts reading
+	// the request — a whole-API safety net (7.7.6) against an
+	// oversized body regardless of route.
+	router.Use(middleware.MaxBodyBytes(maxRequestBodyBytes), middleware.Logging(logger), middleware.CORS(), gin.Recovery())
 
 	detectorClient := detector.NewClient(cfg.DetectorBaseURL, cfg.DetectorTimeout)
 	audioClient := audio.NewClient(cfg.AudioDetectorBaseURL, cfg.AudioDetectorTimeout)
@@ -163,11 +182,14 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	sessionService := session.NewService(detectorClient, audioClient, temporalAnalyzer, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
 	riskEngine := risk.NewEngine()
 	realtimeCfg := realtime.Config{
-		MaxVideoQueue: cfg.RealtimeMaxVideoQueue,
-		VideoWorkers:  cfg.RealtimeVideoWorkers,
-		MaxAudioQueue: cfg.RealtimeMaxAudioQueue,
-		AudioWorkers:  cfg.RealtimeAudioWorkers,
-		MaxSessions:   cfg.RealtimeMaxSessions,
+		MaxVideoQueue:      cfg.RealtimeMaxVideoQueue,
+		VideoWorkers:       cfg.RealtimeVideoWorkers,
+		MaxAudioQueue:      cfg.RealtimeMaxAudioQueue,
+		AudioWorkers:       cfg.RealtimeAudioWorkers,
+		MaxSessions:        cfg.RealtimeMaxSessions,
+		MaxSessionDuration: cfg.RealtimeMaxSessionDuration,
+		MaxFrames:          cfg.RealtimeMaxFrames,
+		MaxAudioChunks:     cfg.RealtimeMaxAudioChunks,
 	}
 	liveSessionStore := realtime.NewStore(detectorClient, audioClient, temporalAnalyzer, riskEngine, realtimeCfg)
 
@@ -202,10 +224,16 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 	v1.GET("/sessions/metrics", auth.RequireRole(auth.RoleAdmin), handlers.NewSessionMetrics(liveSessionStore))
 	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
-	// POST /analysis gets a stricter limit layered on top of the
+	// POST /analysis gets a stricter rate limit layered on top of the
 	// group's default 60/min — it creates async jobs that go on to call
-	// a Python detector, so it's worth capping harder than a cheap GET.
-	v1.POST("/analysis", ratelimit.Middleware(limiter, "analysis-create", analysisCreateRateLimit, logger), handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, urlValidator, logger))
+	// a Python detector, so it's worth capping harder than a cheap GET —
+	// and a much tighter body-size limit (7.7.6) than the whole-API one,
+	// since its body is never more than a session_id and up to two URLs.
+	v1.POST("/analysis",
+		ratelimit.Middleware(limiter, "analysis-create", analysisCreateRateLimit, logger),
+		middleware.MaxBodyBytes(maxJSONRequestBodyBytes),
+		handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, urlValidator, logger),
+	)
 	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))
 
 	return &Server{

@@ -246,6 +246,37 @@ func TestSession_Create_StartsActive(t *testing.T) {
 	}
 }
 
+func TestSession_Deadline_NoLimitConfigured_ReturnsZero(t *testing.T) {
+	session := newTestSession(t, &fakeVideoFrameAnalyzer{}, &fakeAudioChunkAnalyzer{}, &fakeTemporalAnalyzer{}, &fakeRiskEngine{})
+	defer session.End()
+
+	if got := session.Deadline(); !got.IsZero() {
+		t.Errorf("Deadline() = %v, want the zero time (smallCfg sets no MaxSessionDuration)", got)
+	}
+}
+
+func TestSession_Deadline_WithLimitConfigured(t *testing.T) {
+	cfg := realtime.Config{MaxVideoQueue: 5, VideoWorkers: 1, MaxAudioQueue: 5, AudioWorkers: 1, MaxSessions: 10, MaxSessionDuration: time.Hour}
+	store := realtime.NewStore(&fakeVideoFrameAnalyzer{}, &fakeAudioChunkAnalyzer{}, &fakeTemporalAnalyzer{}, &fakeRiskEngine{}, cfg)
+
+	before := time.Now()
+	session, err := store.Create()
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer session.End()
+
+	deadline := session.Deadline()
+
+	if deadline.IsZero() {
+		t.Fatal("Deadline() = zero time, want approximately one hour from now")
+	}
+	if deadline.Before(before.Add(time.Hour)) || deadline.After(after.Add(time.Hour)) {
+		t.Errorf("Deadline() = %v, want within [%v, %v]", deadline, before.Add(time.Hour), after.Add(time.Hour))
+	}
+}
+
 func TestSession_SubmitFrame_ProducesVideoResultThenRiskUpdate(t *testing.T) {
 	video := &fakeVideoFrameAnalyzer{results: []*detector.FrameResult{
 		{FaceDetected: true, FakeProbability: 0.8, Verdict: "fake"},

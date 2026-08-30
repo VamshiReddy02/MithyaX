@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -294,6 +296,38 @@ func TestCreateAnalysisJob_InvalidRequest(t *testing.T) {
 	}
 }
 
+// TestCreateAnalysisJob_URLTooLong proves 7.7.6's maximum URL length:
+// a video_url or audio_url longer than allowed is rejected outright,
+// before it's ever persisted or enqueued — regardless of whether the
+// oversized string would eventually fail SSRF validation too.
+func TestCreateAnalysisJob_URLTooLong(t *testing.T) {
+	tooLong := "https://example.com/" + strings.Repeat("a", 2048) + ".mp4"
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"video_url too long", fmt.Sprintf(`{"session_id":"session-1","video_url":%q}`, tooLong)},
+		{"audio_url too long", fmt.Sprintf(`{"session_id":"session-1","audio_url":%q}`, tooLong)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			videoQueue := &fakeAnalysisQueue{}
+			audioQueue := &fakeAnalysisQueue{}
+			jobs := newFakeAnalysisJobsRepo()
+			router := newCreateAnalysisRouter(videoQueue, audioQueue, jobs)
+
+			rec := doPostAnalysis(t, router, tt.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if videoQueue.count() != 0 || audioQueue.count() != 0 {
+				t.Error("a job was enqueued despite the oversized URL")
+			}
+		})
+	}
+}
+
 // TestCreateAnalysisJob_QueueUnavailable proves that when Redis is
 // unreachable after the durable record was already written, the
 // handler doesn't leave that record silently stuck at "queued"
@@ -320,6 +354,33 @@ func TestCreateAnalysisJob_QueueUnavailable(t *testing.T) {
 	}
 	if found.Status != jobsrepo.StatusDeadLetter {
 		t.Errorf("job status = %q, want dead_letter — the enqueue failure must be reflected, not left as queued forever", found.Status)
+	}
+}
+
+// TestCreateAnalysisJob_PostgresUnavailable is 7.7.7's adversarial
+// counterpart to TestCreateAnalysisJob_QueueUnavailable: the durable
+// jobs record is written first (see NewCreateAnalysisJob's own doc for
+// why), so if Postgres itself is unreachable, jobs.Create fails before
+// Redis is ever touched at all. This must fail cleanly (500, no panic,
+// no job ever queued) rather than silently falling through to enqueue
+// a job nothing will ever be able to look up the status of.
+func TestCreateAnalysisJob_PostgresUnavailable(t *testing.T) {
+	videoQueue := &fakeAnalysisQueue{}
+	audioQueue := &fakeAnalysisQueue{}
+	jobs := newFakeAnalysisJobsRepo()
+	jobs.createErr = errors.New("dial tcp: connect: connection refused")
+	router := newCreateAnalysisRouter(videoQueue, audioQueue, jobs)
+
+	rec := doPostAnalysis(t, router, `{"session_id":"session-5","video_url":"https://example.com/v.mp4"}`)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	if videoQueue.count() != 0 {
+		t.Error("a job was enqueued into Redis despite the Postgres write failing — the durable record must exist before anything is queued")
+	}
+	if len(jobs.jobs) != 0 {
+		t.Error("a job record exists despite Create() having failed")
 	}
 }
 

@@ -78,6 +78,21 @@ type Config struct {
 	// memory growth if far more sessions are created than the detector
 	// services can actually keep up with.
 	RealtimeMaxSessions int
+	// RealtimeMaxSessionDuration bounds how long a single live session
+	// may stay open (7.7.6) — an idle-but-still-pinging connection is
+	// closed at this boundary too, not just an actively streaming one
+	// (see internal/realtime.Client's clamped read deadline), so this
+	// also protects against a session quietly holding one of
+	// RealtimeMaxSessions' slots open forever.
+	RealtimeMaxSessionDuration time.Duration
+	// RealtimeMaxFrames and RealtimeMaxAudioChunks bound the total
+	// number of frames/audio chunks a single session may submit over
+	// its entire lifetime (7.7.6) — a generous safety net independent
+	// of RealtimeMaxSessionDuration, against a misbehaving or malicious
+	// client blasting far more data than any real sampling rate would
+	// ever produce.
+	RealtimeMaxFrames      int
+	RealtimeMaxAudioChunks int
 	// VideoWorkers is how many goroutines concurrently consume
 	// VIDEO_ANALYSIS jobs from the async Redis queue (see
 	// internal/analysisworker). Unrelated to RealtimeVideoWorkers, which
@@ -102,26 +117,29 @@ type Config struct {
 }
 
 const (
-	defaultPort                  = "8080"
-	defaultEnvironment           = "development"
-	defaultLogLevel              = "info"
-	defaultShutdownTimeout       = 10 * time.Second
-	defaultWorkerShutdownTimeout = 2 * time.Minute
-	defaultDetectorBaseURL       = "http://localhost:8000"
-	defaultDetectorTimeout       = 60 * time.Second
-	defaultAudioDetectorBaseURL  = "http://localhost:8001"
-	defaultAudioDetectorTimeout  = 60 * time.Second
-	defaultWorkerCount           = 4
-	defaultWorkerQueueSize       = 64
-	defaultRedisURL              = "redis://localhost:6379"
-	defaultJobTTL                = 24 * time.Hour
-	defaultRealtimeMaxVideoQueue = 10
-	defaultRealtimeVideoWorkers  = 2
-	defaultRealtimeMaxAudioQueue = 10
-	defaultRealtimeAudioWorkers  = 2
-	defaultRealtimeMaxSessions   = 100
-	defaultVideoWorkers          = 2
-	defaultAudioWorkers          = 2
+	defaultPort                       = "8080"
+	defaultEnvironment                = "development"
+	defaultLogLevel                   = "info"
+	defaultShutdownTimeout            = 10 * time.Second
+	defaultWorkerShutdownTimeout      = 2 * time.Minute
+	defaultDetectorBaseURL            = "http://localhost:8000"
+	defaultDetectorTimeout            = 60 * time.Second
+	defaultAudioDetectorBaseURL       = "http://localhost:8001"
+	defaultAudioDetectorTimeout       = 60 * time.Second
+	defaultWorkerCount                = 4
+	defaultWorkerQueueSize            = 64
+	defaultRedisURL                   = "redis://localhost:6379"
+	defaultJobTTL                     = 24 * time.Hour
+	defaultRealtimeMaxVideoQueue      = 10
+	defaultRealtimeVideoWorkers       = 2
+	defaultRealtimeMaxAudioQueue      = 10
+	defaultRealtimeAudioWorkers       = 2
+	defaultRealtimeMaxSessions        = 100
+	defaultVideoWorkers               = 2
+	defaultAudioWorkers               = 2
+	defaultRealtimeMaxSessionDuration = 60 * time.Minute
+	defaultRealtimeMaxFrames          = 100_000
+	defaultRealtimeMaxAudioChunks     = 50_000
 )
 
 // Load builds a Config from environment variables, falling back to
@@ -130,29 +148,32 @@ const (
 // explicitly (see deployments/docker/.env.example).
 func Load() (Config, error) {
 	cfg := Config{
-		Port:                  getEnv("GATEWAY_PORT", defaultPort),
-		Environment:           getEnv("GATEWAY_ENV", defaultEnvironment),
-		LogLevel:              getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
-		ShutdownTimeout:       defaultShutdownTimeout,
-		WorkerShutdownTimeout: defaultWorkerShutdownTimeout,
-		DetectorBaseURL:       getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
-		DetectorTimeout:       defaultDetectorTimeout,
-		AudioDetectorBaseURL:  getEnv("GATEWAY_AUDIO_DETECTOR_URL", defaultAudioDetectorBaseURL),
-		AudioDetectorTimeout:  defaultAudioDetectorTimeout,
-		WorkerCount:           defaultWorkerCount,
-		WorkerQueueSize:       defaultWorkerQueueSize,
-		RedisURL:              getEnv("GATEWAY_REDIS_URL", defaultRedisURL),
-		DatabaseURL:           os.Getenv("GATEWAY_DATABASE_URL"),
-		JobTTL:                defaultJobTTL,
-		RealtimeMaxVideoQueue: defaultRealtimeMaxVideoQueue,
-		RealtimeVideoWorkers:  defaultRealtimeVideoWorkers,
-		RealtimeMaxAudioQueue: defaultRealtimeMaxAudioQueue,
-		RealtimeAudioWorkers:  defaultRealtimeAudioWorkers,
-		RealtimeMaxSessions:   defaultRealtimeMaxSessions,
-		VideoWorkers:          defaultVideoWorkers,
-		AudioWorkers:          defaultAudioWorkers,
-		AuthToken:             os.Getenv("GATEWAY_AUTH_TOKEN"),
-		AdminAuthToken:        os.Getenv("GATEWAY_ADMIN_AUTH_TOKEN"),
+		Port:                       getEnv("GATEWAY_PORT", defaultPort),
+		Environment:                getEnv("GATEWAY_ENV", defaultEnvironment),
+		LogLevel:                   getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
+		ShutdownTimeout:            defaultShutdownTimeout,
+		WorkerShutdownTimeout:      defaultWorkerShutdownTimeout,
+		DetectorBaseURL:            getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
+		DetectorTimeout:            defaultDetectorTimeout,
+		AudioDetectorBaseURL:       getEnv("GATEWAY_AUDIO_DETECTOR_URL", defaultAudioDetectorBaseURL),
+		AudioDetectorTimeout:       defaultAudioDetectorTimeout,
+		WorkerCount:                defaultWorkerCount,
+		WorkerQueueSize:            defaultWorkerQueueSize,
+		RedisURL:                   getEnv("GATEWAY_REDIS_URL", defaultRedisURL),
+		DatabaseURL:                os.Getenv("GATEWAY_DATABASE_URL"),
+		JobTTL:                     defaultJobTTL,
+		RealtimeMaxVideoQueue:      defaultRealtimeMaxVideoQueue,
+		RealtimeVideoWorkers:       defaultRealtimeVideoWorkers,
+		RealtimeMaxAudioQueue:      defaultRealtimeMaxAudioQueue,
+		RealtimeAudioWorkers:       defaultRealtimeAudioWorkers,
+		RealtimeMaxSessions:        defaultRealtimeMaxSessions,
+		RealtimeMaxSessionDuration: defaultRealtimeMaxSessionDuration,
+		RealtimeMaxFrames:          defaultRealtimeMaxFrames,
+		RealtimeMaxAudioChunks:     defaultRealtimeMaxAudioChunks,
+		VideoWorkers:               defaultVideoWorkers,
+		AudioWorkers:               defaultAudioWorkers,
+		AuthToken:                  os.Getenv("GATEWAY_AUTH_TOKEN"),
+		AdminAuthToken:             os.Getenv("GATEWAY_ADMIN_AUTH_TOKEN"),
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -226,6 +247,19 @@ func Load() (Config, error) {
 	}
 	if cfg.RealtimeMaxSessions, err = positiveIntEnv("REALTIME_MAX_SESSIONS", cfg.RealtimeMaxSessions); err != nil {
 		return Config{}, err
+	}
+	if cfg.RealtimeMaxFrames, err = positiveIntEnv("REALTIME_MAX_FRAMES", cfg.RealtimeMaxFrames); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealtimeMaxAudioChunks, err = positiveIntEnv("REALTIME_MAX_AUDIO_CHUNKS", cfg.RealtimeMaxAudioChunks); err != nil {
+		return Config{}, err
+	}
+	if raw, ok := os.LookupEnv("REALTIME_MAX_SESSION_DURATION"); ok {
+		d, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || d <= 0 {
+			return Config{}, fmt.Errorf("invalid REALTIME_MAX_SESSION_DURATION %q: must be a positive duration", raw)
+		}
+		cfg.RealtimeMaxSessionDuration = d
 	}
 	if cfg.VideoWorkers, err = positiveIntEnv("GATEWAY_VIDEO_WORKERS", cfg.VideoWorkers); err != nil {
 		return Config{}, err

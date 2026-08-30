@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
@@ -95,6 +96,18 @@ type Session struct {
 	id        string
 	createdAt time.Time
 
+	// maxSessionDuration, maxFrames, and maxAudioChunks are 7.7.6's
+	// resource caps — see Deadline and countLimitExceeded. Zero
+	// maxSessionDuration means no duration cap (Deadline returns the
+	// zero time); maxFrames/maxAudioChunks <= 0 similarly means
+	// uncapped, though production wiring (see internal/config) always
+	// sets a positive value.
+	maxSessionDuration time.Duration
+	maxFrames          int64
+	maxAudioChunks     int64
+	frameCount         atomic.Int64
+	audioChunkCount    atomic.Int64
+
 	videoClient      VideoFrameAnalyzer
 	audioClient      AudioChunkAnalyzer
 	temporalAnalyzer TemporalAnalyzer
@@ -125,19 +138,22 @@ func newSession(id string, videoClient VideoFrameAnalyzer, audioClient AudioChun
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Session{
-		id:               id,
-		createdAt:        time.Now(),
-		status:           StatusActive,
-		videoClient:      videoClient,
-		audioClient:      audioClient,
-		temporalAnalyzer: temporalAnalyzer,
-		riskEngine:       riskEngine,
-		metrics:          metrics,
-		videoQueue:       make(chan frameJob, cfg.MaxVideoQueue),
-		audioQueue:       make(chan audioJob, cfg.MaxAudioQueue),
-		out:              make(chan OutMessage, outBuffer),
-		ctx:              ctx,
-		cancel:           cancel,
+		id:                 id,
+		createdAt:          time.Now(),
+		maxSessionDuration: cfg.MaxSessionDuration,
+		maxFrames:          int64(cfg.MaxFrames),
+		maxAudioChunks:     int64(cfg.MaxAudioChunks),
+		status:             StatusActive,
+		videoClient:        videoClient,
+		audioClient:        audioClient,
+		temporalAnalyzer:   temporalAnalyzer,
+		riskEngine:         riskEngine,
+		metrics:            metrics,
+		videoQueue:         make(chan frameJob, cfg.MaxVideoQueue),
+		audioQueue:         make(chan audioJob, cfg.MaxAudioQueue),
+		out:                make(chan OutMessage, outBuffer),
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 
 	for i := 0; i < cfg.VideoWorkers; i++ {
@@ -179,6 +195,7 @@ func (s *Session) Out() <-chan OutMessage {
 // one; the caller should tell the browser the session is overloaded.
 func (s *Session) SubmitFrame(jpeg []byte) bool {
 	s.metrics.framesReceived.Add(1)
+	s.frameCount.Add(1)
 	job := frameJob{data: jpeg}
 
 	select {
@@ -219,6 +236,7 @@ func (s *Session) SubmitFrame(jpeg []byte) bool {
 // an explicit overload signal (see ErrCodeOverloaded).
 func (s *Session) SubmitAudioChunk(filename string, data []byte) bool {
 	s.metrics.audioChunksReceived.Add(1)
+	s.audioChunkCount.Add(1)
 
 	select {
 	case s.audioQueue <- audioJob{filename: filename, data: data}:
@@ -228,6 +246,41 @@ func (s *Session) SubmitAudioChunk(filename string, data []byte) bool {
 		s.metrics.audioChunksDropped.Add(1)
 		return false
 	}
+}
+
+// Deadline returns the time at which this session must stop accepting
+// new reads, based on maxSessionDuration — the zero time if no maximum
+// is configured. Client's read loop clamps its normal keep-alive read
+// deadline to this (see Client.resetReadDeadline), which is what
+// actually enforces 7.7.6's maximum session duration: an idle-but-
+// still-pinging connection hits this boundary exactly the same as one
+// still actively streaming frames, since both rely on the same
+// SetReadDeadline mechanism rather than a separate timer that would
+// only fire in response to activity.
+func (s *Session) Deadline() time.Time {
+	if s.maxSessionDuration <= 0 {
+		return time.Time{}
+	}
+	return s.createdAt.Add(s.maxSessionDuration)
+}
+
+// countLimitExceeded reports whether this session has processed more
+// than its configured maximum frames or audio chunks (7.7.6) — a
+// generous safety net against a misbehaving or malicious client
+// blasting far more data than any real sampling rate would produce,
+// independent of Deadline's time-based cap. Unlike SubmitFrame/
+// SubmitAudioChunk's own queue-full rejection (transient — the very
+// next frame might fit), exceeding this means the session is
+// permanently done; see Client's read loop, the sole caller, for what
+// happens next.
+func (s *Session) countLimitExceeded() (reason string, exceeded bool) {
+	if s.maxFrames > 0 && s.frameCount.Load() > s.maxFrames {
+		return "maximum frame count exceeded", true
+	}
+	if s.maxAudioChunks > 0 && s.audioChunkCount.Load() > s.maxAudioChunks {
+		return "maximum audio chunk count exceeded", true
+	}
+	return "", false
 }
 
 func (s *Session) videoWorker() {

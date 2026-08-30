@@ -14,6 +14,16 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
 
+// maxURLLength bounds video_url/audio_url (7.7.6) — 2048 is the
+// conventional ceiling most browsers and servers already treat as a
+// practical URL length limit, comfortably larger than any real media
+// URL. Checked before SSRF validation: it's a cheaper, purely
+// syntactic rejection that also happens to be exactly what keeps an
+// AnalysisJob's payload (just a URL string — see internal/analysisjob)
+// small and predictable before it's ever persisted to Postgres or
+// pushed onto the Redis queue.
+const maxURLLength = 2048
+
 // createAnalysisRequest is the POST /api/v1/analysis body (7.6.1):
 // session_id plus at least one of video_url/audio_url. Requesting both
 // creates two independent jobs sharing session_id (7.6.2).
@@ -66,6 +76,14 @@ func NewCreateAnalysisJob(videoQueue, audioQueue queue.Queue, jobs jobsrepo.Repo
 		}
 		if req.VideoURL == "" && req.AudioURL == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of video_url or audio_url is required"})
+			return
+		}
+		if len(req.VideoURL) > maxURLLength {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "video_url exceeds maximum length"})
+			return
+		}
+		if len(req.AudioURL) > maxURLLength {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "audio_url exceeds maximum length"})
 			return
 		}
 

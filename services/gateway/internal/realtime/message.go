@@ -90,3 +90,10 @@ type OutMessage struct {
 // audio queue genuinely can't accept more work right now — see
 // Session.SubmitFrame/SubmitAudioChunk.
 const ErrCodeOverloaded = "overloaded"
+
+// ErrCodeSessionLimitExceeded is the error Code sent immediately
+// before a session is ended for exceeding one of its 7.7.6 resource
+// caps (maximum frames or audio chunks over its lifetime) — distinct
+// from ErrCodeOverloaded because this is permanent: the session is
+// over, not just momentarily busy. See Session.countLimitExceeded.
+const ErrCodeSessionLimitExceeded = "session_limit_exceeded"

@@ -74,6 +74,15 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RealtimeMaxSessions != defaultRealtimeMaxSessions {
 		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, defaultRealtimeMaxSessions)
 	}
+	if cfg.RealtimeMaxSessionDuration != defaultRealtimeMaxSessionDuration {
+		t.Errorf("RealtimeMaxSessionDuration = %v, want %v", cfg.RealtimeMaxSessionDuration, defaultRealtimeMaxSessionDuration)
+	}
+	if cfg.RealtimeMaxFrames != defaultRealtimeMaxFrames {
+		t.Errorf("RealtimeMaxFrames = %d, want %d", cfg.RealtimeMaxFrames, defaultRealtimeMaxFrames)
+	}
+	if cfg.RealtimeMaxAudioChunks != defaultRealtimeMaxAudioChunks {
+		t.Errorf("RealtimeMaxAudioChunks = %d, want %d", cfg.RealtimeMaxAudioChunks, defaultRealtimeMaxAudioChunks)
+	}
 	if cfg.VideoWorkers != defaultVideoWorkers {
 		t.Errorf("VideoWorkers = %d, want %d", cfg.VideoWorkers, defaultVideoWorkers)
 	}
@@ -107,6 +116,9 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("REALTIME_MAX_AUDIO_QUEUE", "15")
 	t.Setenv("REALTIME_AUDIO_WORKERS", "3")
 	t.Setenv("REALTIME_MAX_SESSIONS", "50")
+	t.Setenv("REALTIME_MAX_SESSION_DURATION", "30m")
+	t.Setenv("REALTIME_MAX_FRAMES", "5000")
+	t.Setenv("REALTIME_MAX_AUDIO_CHUNKS", "2500")
 	t.Setenv("GATEWAY_VIDEO_WORKERS", "5")
 	t.Setenv("GATEWAY_AUDIO_WORKERS", "4")
 	t.Setenv("GATEWAY_AUTH_TOKEN", "override-token")
@@ -170,6 +182,15 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.RealtimeMaxSessions != 50 {
 		t.Errorf("RealtimeMaxSessions = %d, want %d", cfg.RealtimeMaxSessions, 50)
+	}
+	if cfg.RealtimeMaxSessionDuration != 30*time.Minute {
+		t.Errorf("RealtimeMaxSessionDuration = %v, want %v", cfg.RealtimeMaxSessionDuration, 30*time.Minute)
+	}
+	if cfg.RealtimeMaxFrames != 5000 {
+		t.Errorf("RealtimeMaxFrames = %d, want %d", cfg.RealtimeMaxFrames, 5000)
+	}
+	if cfg.RealtimeMaxAudioChunks != 2500 {
+		t.Errorf("RealtimeMaxAudioChunks = %d, want %d", cfg.RealtimeMaxAudioChunks, 2500)
 	}
 	if cfg.VideoWorkers != 5 {
 		t.Errorf("VideoWorkers = %d, want %d", cfg.VideoWorkers, 5)
@@ -238,6 +259,38 @@ func TestLoad_InvalidRealtimeMaxSessions(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with invalid REALTIME_MAX_SESSIONS: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxFrames(t *testing.T) {
+	t.Setenv("REALTIME_MAX_FRAMES", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with REALTIME_MAX_FRAMES=0: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxAudioChunks(t *testing.T) {
+	t.Setenv("REALTIME_MAX_AUDIO_CHUNKS", "not-a-number")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid REALTIME_MAX_AUDIO_CHUNKS: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidRealtimeMaxSessionDuration(t *testing.T) {
+	t.Setenv("REALTIME_MAX_SESSION_DURATION", "not-a-duration")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid REALTIME_MAX_SESSION_DURATION: expected error, got nil")
+	}
+}
+
+func TestLoad_ZeroRealtimeMaxSessionDuration_Rejected(t *testing.T) {
+	t.Setenv("REALTIME_MAX_SESSION_DURATION", "0s")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with REALTIME_MAX_SESSION_DURATION=0s: expected error, got nil")
 	}
 }
 

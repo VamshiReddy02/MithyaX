@@ -95,15 +95,25 @@ func (c *Client) ReadPump() {
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.resetReadDeadline()
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.resetReadDeadline()
 		return nil
 	})
 
 	for {
 		var in InMessage
 		if err := c.conn.ReadJSON(&in); err != nil {
+			return
+		}
+
+		// 7.7.6: a session that has processed more than its configured
+		// maximum frames/audio chunks is done for good, regardless of
+		// which message type arrives next — checked once per message
+		// here rather than duplicated in handleFrame/handleAudioChunk.
+		if reason, exceeded := c.session.countLimitExceeded(); exceeded {
+			c.Send(OutMessage{Type: TypeError, Code: ErrCodeSessionLimitExceeded, Message: reason})
+			c.Send(c.session.End())
 			return
 		}
 
@@ -119,6 +129,23 @@ func (c *Client) ReadPump() {
 			c.Send(OutMessage{Type: TypeError, Message: fmt.Sprintf("unknown message type %q", in.Type)})
 		}
 	}
+}
+
+// resetReadDeadline pushes the connection's read deadline out by
+// pongWait, the same keep-alive mechanism every WebSocket in this
+// package uses — except clamped to never exceed the session's own
+// Deadline (7.7.6's maximum session duration), if one is configured.
+// Once that clamp takes effect, the next read (including just the
+// keep-alive pong itself) times out right at the boundary, and
+// ReadPump's normal error-triggers-cleanup path takes it from there —
+// no separate timer needed, and it works the same whether the session
+// is actively streaming or has simply gone idle.
+func (c *Client) resetReadDeadline() {
+	deadline := time.Now().Add(pongWait)
+	if sessionDeadline := c.session.Deadline(); !sessionDeadline.IsZero() && sessionDeadline.Before(deadline) {
+		deadline = sessionDeadline
+	}
+	c.conn.SetReadDeadline(deadline)
 }
 
 func (c *Client) handleFrame(in InMessage) {

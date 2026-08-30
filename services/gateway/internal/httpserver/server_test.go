@@ -522,3 +522,136 @@ func TestServer_SSRFProtection_CannotBypass(t *testing.T) {
 		t.Errorf("POST /api/v1/analysis with a blocked audio_url status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
+
+// TestServer_RequestBodyLimitWiring proves 7.7.6's request-body-size
+// gap is actually closed at the real POST /api/v1/analysis route: a
+// body far larger than any legitimate {session_id, video_url,
+// audio_url} payload could ever need is rejected before the handler's
+// own JSON binding (let alone SSRF validation) ever runs — proven by
+// the fact no job ever makes it onto the Redis queue, the same way
+// TestServer_SSRFProtection_CannotBypass checks its own rejections.
+// internal/middleware's own tests already cover MaxBodyBytes and its
+// chaining behavior in isolation; this is only about whether server.go
+// actually applied it to this route.
+func TestServer_RequestBodyLimitWiring(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                 "0",
+		Environment:          "test",
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          1,
+		WorkerQueueSize:      1,
+		RedisURL:             "redis://" + mr.Addr(),
+		JobTTL:               time.Hour,
+		AuthToken:            testAuthToken,
+		AdminAuthToken:       testAdminAuthToken,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	// Comfortably over POST /api/v1/analysis's tight JSON body limit,
+	// comfortably under the whole-API's generous one — proving it's
+	// specifically the route's own tighter limit doing the rejecting,
+	// not the outer safety net.
+	oversizedURL := "https://example.com/" + strings.Repeat("a", 32<<10) + ".mp4"
+	body := fmt.Sprintf(`{"session_id":"session-1","video_url":%q}`, oversizedURL)
+
+	resp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /api/v1/analysis with an oversized body status = %d, want %d or %d", resp.StatusCode, http.StatusRequestEntityTooLarge, http.StatusBadRequest)
+	}
+
+	if mr.Exists("mithyax:jobs:video_analysis") {
+		entries, listErr := mr.List("mithyax:jobs:video_analysis")
+		if listErr != nil {
+			t.Fatalf("mr.List() error = %v", listErr)
+		}
+		if len(entries) != 0 {
+			t.Error("a job was enqueued despite the oversized request body")
+		}
+	}
+}
+
+// TestServer_PostgresUnavailable_AnalysisAPIFailsSafely is 7.7.7's
+// adversarial check for a dependency outage through the real server
+// wiring (not fakes): with Postgres genuinely unreachable, POST
+// /api/v1/analysis — whose jobs.Create write happens before Redis is
+// ever touched — must fail cleanly (a 5xx, no panic, no hang) and,
+// just as importantly, must never fall through to enqueueing a job
+// nothing could ever look up the status of.
+func TestServer_PostgresUnavailable_AnalysisAPIFailsSafely(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                 "0",
+		Environment:          "test",
+		DetectorTimeout:      5 * time.Second,
+		AudioDetectorTimeout: 5 * time.Second,
+		WorkerCount:          1,
+		WorkerQueueSize:      1,
+		RedisURL:             "redis://" + mr.Addr(),
+		// Nothing is listening here — pgxpool connects lazily, so
+		// httpserver.New itself succeeds; the failure surfaces the
+		// first time a query actually runs, exactly like a real outage.
+		DatabaseURL:    "postgres://user:pass@127.0.0.1:1/nonexistent?connect_timeout=1",
+		JobTTL:         time.Hour,
+		AuthToken:      testAuthToken,
+		AdminAuthToken: testAdminAuthToken,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	done := make(chan *http.Response, 1)
+	go func() {
+		body := `{"session_id":"session-1","video_url":"https://example.com/video.mp4"}`
+		resp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analysis", "application/json", strings.NewReader(body))
+		done <- resp
+	}()
+
+	select {
+	case resp := <-done:
+		defer resp.Body.Close()
+		if resp.StatusCode < 500 {
+			t.Errorf("status = %d, want a 5xx — Postgres is unreachable, this can't have succeeded", resp.StatusCode)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("request never returned — an unreachable Postgres must fail fast, not hang the request indefinitely")
+	}
+
+	if mr.Exists("mithyax:jobs:video_analysis") {
+		entries, listErr := mr.List("mithyax:jobs:video_analysis")
+		if listErr != nil {
+			t.Fatalf("mr.List() error = %v", listErr)
+		}
+		if len(entries) != 0 {
+			t.Error("a job was enqueued into Redis despite the Postgres write failing")
+		}
+	}
+}

@@ -330,3 +330,72 @@ func TestSessionWebSocket_OverloadedAudioQueue_EmitsOverloadedErrorCode(t *testi
 		t.Fatalf("got %+v, want {type: error, code: overloaded}", got)
 	}
 }
+
+// TestSessionWebSocket_MaxFrames_EndsSession proves 7.7.6's lifetime
+// frame cap: once a session has processed more frames than
+// MaxFrames, the next frame is rejected with ErrCodeSessionLimitExceeded
+// and the session ends outright — unlike ErrCodeOverloaded (a full
+// queue, worth retrying), this is permanent, so no further video_result
+// messages should ever follow.
+func TestSessionWebSocket_MaxFrames_EndsSession(t *testing.T) {
+	video := &fakeRealtimeVideoAnalyzer{result: &detector.FrameResult{FaceDetected: true, FakeProbability: 0.5, Verdict: "real"}}
+	cfg := realtime.Config{MaxVideoQueue: 5, VideoWorkers: 1, MaxAudioQueue: 5, AudioWorkers: 1, MaxSessions: 10, MaxFrames: 2}
+	store := realtime.NewStore(video, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, cfg)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
+
+	sessionID := createSession(t, baseURL)
+	conn := dialSession(t, baseURL, sessionID)
+	readOutMessage(t, conn) // session_started
+
+	frameMsg := realtime.InMessage{Type: realtime.TypeFrame, Data: base64.StdEncoding.EncodeToString([]byte("jpeg-bytes"))}
+
+	// Send frames until the limit trips, bounded well past where it
+	// must (MaxFrames=2) so this doesn't hang forever if the feature
+	// regresses — it should trip within the first handful of frames.
+	const maxAttempts = 8
+	for i := 1; i <= maxAttempts; i++ {
+		if err := conn.WriteJSON(frameMsg); err != nil {
+			t.Fatalf("WriteJSON(frame %d): %v", i, err)
+		}
+
+		first := readOutMessage(t, conn)
+		if first.Type == realtime.TypeError && first.Code == realtime.ErrCodeSessionLimitExceeded {
+			second := readOutMessage(t, conn)
+			if second.Type != realtime.TypeSessionEnded {
+				t.Fatalf("after session_limit_exceeded, got %+v, want session_ended", second)
+			}
+			return // success
+		}
+		if first.Type != realtime.TypeVideoResult {
+			t.Fatalf("frame %d: got %+v, want video_result or the limit-exceeded error", i, first)
+		}
+		readOutMessage(t, conn) // the accompanying risk_update
+	}
+	t.Fatalf("sent %d frames (MaxFrames=2) without the session ever hitting its limit", maxAttempts)
+}
+
+// TestSessionWebSocket_MaxSessionDuration_ClosesIdleConnection proves
+// 7.7.6's maximum session duration is enforced by the read-deadline
+// clamp (Client.resetReadDeadline), not just when a frame/chunk
+// happens to arrive: a connection that sends nothing at all past its
+// configured MaxSessionDuration must still be closed by the server.
+func TestSessionWebSocket_MaxSessionDuration_ClosesIdleConnection(t *testing.T) {
+	cfg := realtime.Config{MaxVideoQueue: 5, VideoWorkers: 1, MaxAudioQueue: 5, AudioWorkers: 1, MaxSessions: 10, MaxSessionDuration: 100 * time.Millisecond}
+	store := realtime.NewStore(&fakeRealtimeVideoAnalyzer{}, &fakeRealtimeAudioAnalyzer{}, &fakeRealtimeTemporalAnalyzer{}, &fakeRealtimeRiskEngine{}, cfg)
+	_, baseURL, _, _ := newSessionWSTestServer(t, store)
+
+	sessionID := createSession(t, baseURL)
+	conn := dialSession(t, baseURL, sessionID)
+	readOutMessage(t, conn) // session_started
+
+	// Send nothing at all. If MaxSessionDuration is being enforced, the
+	// server closes the connection on its own well within this
+	// generous 2s wait; if the feature regresses (no clamp), this read
+	// would instead hang for the full 2s and fail.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var msg realtime.OutMessage
+	err := conn.ReadJSON(&msg)
+	if err == nil {
+		t.Fatalf("ReadJSON succeeded with %+v, want the connection closed by the server's session-duration limit", msg)
+	}
+}
