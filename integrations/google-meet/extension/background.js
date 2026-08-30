@@ -119,10 +119,26 @@ chrome.runtime.onConnect.addListener((port) => {
               state = applyMessage(state, msg);
               safePost({ type: "state", state, raw: msg });
             },
-            onClose: () => safePost({ type: "closed" }),
-            onError: (err) => safePost({ type: "error", message: String(err) }),
+            onClose: () => {
+              console.warn("MithyaX: session websocket closed.");
+              safePost({ type: "closed" });
+            },
+            onError: (err) => {
+              console.error("MithyaX: session error —", err);
+              safePost({ type: "error", message: String(err) });
+            },
           });
         } catch (err) {
+          // Getting here means either the credential exchange itself
+          // failed (bad/unset GATEWAY_EXTENSION_TOKEN, gateway
+          // unreachable) or POST /api/v1/sessions failed for a reason
+          // other than an expired credential (connectSession already
+          // retries that case once). Logged here — not just forwarded to
+          // content.js via safePost below — because this is the service
+          // worker's own console, and content.js's tab console is a
+          // second, separate place to check; a failure here previously
+          // had nowhere it reliably showed up at all.
+          console.error("MithyaX: failed to start session —", err);
           safePost({ type: "error", message: String(err) });
           session = null;
         }

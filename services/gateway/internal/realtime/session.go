@@ -53,6 +53,71 @@ const maxFrameBuffer = 60
 // momentarily slow WritePump without blocking on it.
 const outBuffer = 64
 
+// videoScoreWindow and audioScoreWindow bound how many recent
+// observations videoScoreSmoother/audioScoreSmoother average over
+// before feeding risk.Signals — found necessary live (8.3 verification):
+// the risk_update signal used to be whichever single frame or audio
+// chunk happened to arrive last, with no averaging at all, so one noisy
+// frame (motion blur, a blink, a compression artifact) could swing the
+// whole verdict on its own — exactly the flickering "suspicious/fake"
+// readings seen on genuinely real video. The uploaded-video pipeline
+// (internal/video-detector's own CLI tools) already reports a mean over
+// every frame in the clip rather than trusting any one frame; a live
+// session can't wait for "the whole call," so this keeps only a short
+// recent window instead — enough to smooth single-frame noise while
+// still tracking a real, sustained change in a long call. Roughly 5s of
+// video (1 frame/sec, see the extension's FRAME_SAMPLE_INTERVAL_MS) and
+// ~9s of audio (3s chunks, see AUDIO_CHUNK_SECONDS) — long enough to
+// smooth, short enough to still feel live.
+const (
+	videoScoreWindow = 5
+	audioScoreWindow = 3
+)
+
+// verdictThreshold mirrors the video-/audio-detector services' own
+// fake/real cutoff (see e.g. services/video-detector/app/server.py's
+// FAKE_THRESHOLD) — used here to re-derive a verdict from the smoothed
+// score, since videoScoreSmoother/audioScoreSmoother's whole point is
+// that the smoothed score, not any single raw observation, is now the
+// authoritative signal.
+const verdictThreshold = 0.5
+
+func verdictFromScore(score float64) string {
+	if score >= verdictThreshold {
+		return "fake"
+	}
+	return "real"
+}
+
+// scoreSmoother averages a noisy sequence of single-observation scores
+// (one video frame, one audio chunk) over its most recent window
+// observations, so a single outlier can't unilaterally swing the
+// combined risk score the way it could when the latest raw observation
+// was used directly. Not safe for concurrent use on its own — callers
+// (Session) already serialize access under their own mutex.
+type scoreSmoother struct {
+	window int
+	values []float64
+}
+
+func newScoreSmoother(window int) *scoreSmoother {
+	return &scoreSmoother{window: window}
+}
+
+// add records v and returns the mean of the most recent window
+// observations (including v).
+func (s *scoreSmoother) add(v float64) float64 {
+	s.values = append(s.values, v)
+	if len(s.values) > s.window {
+		s.values = s.values[len(s.values)-s.window:]
+	}
+	var sum float64
+	for _, x := range s.values {
+		sum += x
+	}
+	return sum / float64(len(s.values))
+}
+
 // VideoFrameAnalyzer analyzes a single JPEG frame. *detector.Client
 // implements it via AnalyzeFrame.
 type VideoFrameAnalyzer interface {
@@ -132,6 +197,9 @@ type Session struct {
 	audioScore    *float64
 	audioVerdict  string
 	temporalScore *float64
+
+	videoScoreSmoother *scoreSmoother
+	audioScoreSmoother *scoreSmoother
 }
 
 func newSession(id string, videoClient VideoFrameAnalyzer, audioClient AudioChunkAnalyzer, temporalAnalyzer TemporalAnalyzer, riskEngine RiskAssessor, cfg Config, metrics *Metrics) *Session {
@@ -154,6 +222,8 @@ func newSession(id string, videoClient VideoFrameAnalyzer, audioClient AudioChun
 		out:                make(chan OutMessage, outBuffer),
 		ctx:                ctx,
 		cancel:             cancel,
+		videoScoreSmoother: newScoreSmoother(videoScoreWindow),
+		audioScoreSmoother: newScoreSmoother(audioScoreWindow),
 	}
 
 	for i := 0; i < cfg.VideoWorkers; i++ {
@@ -335,11 +405,13 @@ func (s *Session) processFrame(jpeg []byte) {
 	// trusting (the video-detector returns 0.0 as a placeholder, not a
 	// measurement) — excluded from the video signal entirely, same as
 	// risk.weightedScore excludes any missing signal rather than
-	// treating it as a confident 0.
+	// treating it as a confident 0. A frame that DID detect a face still
+	// only feeds videoScoreSmoother's rolling window rather than
+	// replacing s.videoScore outright — see videoScoreWindow's doc.
 	if result.FaceDetected {
-		score := result.FakeProbability
-		s.videoScore = &score
-		s.videoVerdict = result.Verdict
+		smoothed := s.videoScoreSmoother.add(result.FakeProbability)
+		s.videoScore = &smoothed
+		s.videoVerdict = verdictFromScore(smoothed)
 	}
 
 	s.frames = append(s.frames, temporal.Frame{
@@ -394,9 +466,9 @@ func (s *Session) processAudioChunk(filename string, data []byte) {
 	s.metrics.audioChunksProcessed.Add(1)
 
 	s.mu.Lock()
-	score := result.FakeScore
-	s.audioScore = &score
-	s.audioVerdict = result.Verdict
+	smoothed := s.audioScoreSmoother.add(result.FakeScore)
+	s.audioScore = &smoothed
+	s.audioVerdict = verdictFromScore(smoothed)
 
 	messages := []OutMessage{audioResultMessage(result), s.riskUpdateLocked()}
 	s.mu.Unlock()

@@ -129,11 +129,42 @@
       return null;
     }
     port.onMessage.addListener((message) => {
-      if (message.type === "state") updateBadge(message.state);
+      switch (message.type) {
+        case "state":
+          updateBadge(message.state);
+          break;
+        // "error"/"closed" used to be silently dropped here — background.js
+        // still forwards them (see its own safePost calls), but nothing
+        // ever surfaced them: the badge stayed frozen wherever it last was
+        // (e.g. "Analyzing" forever) with no visible sign anything had gone
+        // wrong. A real cause is a plain fetch/WebSocket failure — a
+        // gateway that isn't reachable, an unedited GATEWAY_EXTENSION_TOKEN
+        // placeholder, credential exchange failing — logged here (and by
+        // background.js itself, see its own console.error) so the failure
+        // is at least visible in one of the two consoles.
+        case "error":
+          console.error("MithyaX: session error —", message.message);
+          updateBadge({ tier: "unknown", label: "Error — see console" });
+          break;
+        case "closed":
+          console.warn("MithyaX: gateway session closed.");
+          updateBadge({ tier: "unknown", label: "Disconnected" });
+          break;
+      }
     });
     port.onDisconnect.addListener(() => {
-      port = null;
-      started = false;
+      // Full cleanup (badge removed, timers actually cleared, audio
+      // capture stopped), not just resetting the two flags below — this
+      // fires whenever background.js's service worker is recycled or
+      // reloaded mid-session (normal MV3 lifecycle, not just tab
+      // close/navigation), and leaving frameTimer/positionTimer running
+      // uncleared meant every such event leaked one more pair of
+      // intervals: the next tick() would call startCapture() again
+      // (since started was reset to false) and create a second set on
+      // top of the still-running first one — most visibly as
+      // positionBadge repeatedly recreating a badge stopCapture had
+      // otherwise just tried to remove.
+      stopCapture();
     });
     return port;
   }
@@ -158,8 +189,21 @@
   async function sampleFrame() {
     if (sampling || !currentVideoEl || !port) return;
     if (!isCurrentVideoElVerifiedRemote()) {
-      console.error("MithyaX: currentVideoEl is no longer verified remote — stopping rather than risk capturing a local camera.");
-      handleFatal(new Error("lost remote-track verification for currentVideoEl"));
+      // Skip only *this* frame — do not treat this as fatal. A remote
+      // participant turning their camera off commonly removes the video
+      // track while leaving the element itself in place (so
+      // currentVideoEl isn't null, but its track no longer verifies as
+      // remote); Meet can also transiently reuse a tile's element across
+      // participants. Neither is a security problem by itself — the
+      // invariant this check protects (never actually send a frame from
+      // a non-remote track) is already satisfied by returning here.
+      // Whether this is a real "participant left" is tick()'s call to
+      // make, via its own grace-period logic — this function has no
+      // business permanently killing the session over what's usually a
+      // normal, temporary state change. (An earlier version of this
+      // check called handleFatal here, which meant a camera-off/on
+      // toggle could permanently end the session until the tab was
+      // reloaded — confirmed live; don't reintroduce that.)
       return;
     }
     sampling = true;

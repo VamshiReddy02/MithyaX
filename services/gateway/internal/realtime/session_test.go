@@ -448,8 +448,12 @@ func TestSession_VideoAudioTemporal_AllThreeFeedTheSameRiskUpdate(t *testing.T) 
 
 	signals := riskEngine.signals()
 	final := signals[len(signals)-1]
-	if !final.VideoOK || final.Video != 0.3 {
-		t.Errorf("final Signals.Video = %+v, want VideoOK=true Video=0.3 (latest frame)", final)
+	// 0.25, not 0.3 (the second, most recent frame's raw score) — the
+	// video signal is now a rolling average over recent frames (see
+	// videoScoreWindow), not whichever frame happened to arrive last,
+	// so it's the mean of both frames submitted here: (0.2+0.3)/2.
+	if !final.VideoOK || final.Video != 0.25 {
+		t.Errorf("final Signals.Video = %+v, want VideoOK=true Video=0.25 (mean of the two submitted frames)", final)
 	}
 	if !final.AudioOK || final.Audio != 0.9 {
 		t.Errorf("final Signals.Audio = %+v, want AudioOK=true Audio=0.9", final)
@@ -460,6 +464,50 @@ func TestSession_VideoAudioTemporal_AllThreeFeedTheSameRiskUpdate(t *testing.T) 
 
 	if len(temp.gotFrames) != 2 {
 		t.Errorf("temporal analyzer got %d frames, want 2 (both processed frames)", len(temp.gotFrames))
+	}
+}
+
+// TestSession_VideoScoreIsSmoothedOverRecentFrames guards the fix for a
+// bug found during real Meet testing (8.3 live verification): the video
+// signal used to be whatever single frame happened to arrive last, so
+// one noisy frame could swing the whole risk_update on its own — this
+// showed up live as a genuinely real face flickering to "Suspicious"/
+// "AI, High risk". It's now a rolling mean over the most recent frames
+// (see videoScoreWindow); this submits more frames than that window
+// holds and checks both that averaging happens and that the window
+// evicts frames older than it.
+func TestSession_VideoScoreIsSmoothedOverRecentFrames(t *testing.T) {
+	video := &fakeVideoFrameAnalyzer{results: []*detector.FrameResult{
+		{FaceDetected: true, FakeProbability: 0.9, Verdict: "fake"}, // will be evicted once a 6th frame arrives
+		{FaceDetected: true, FakeProbability: 0.2, Verdict: "real"},
+		{FaceDetected: true, FakeProbability: 0.2, Verdict: "real"},
+		{FaceDetected: true, FakeProbability: 0.2, Verdict: "real"},
+		{FaceDetected: true, FakeProbability: 0.2, Verdict: "real"},
+		{FaceDetected: true, FakeProbability: 0.2, Verdict: "real"},
+	}}
+	riskEngine := &fakeRiskEngine{}
+	session := newTestSession(t, video, &fakeAudioChunkAnalyzer{}, &fakeTemporalAnalyzer{}, riskEngine)
+	defer session.End()
+
+	for i := 0; i < 6; i++ {
+		submitFrameAndDrain(t, session, []byte(fmt.Sprintf("frame-%d", i)), 2) // video_result, risk_update
+	}
+
+	signals := riskEngine.signals()
+
+	// After frame 2 (the first two: 0.9, 0.2), the mean of both is 0.55
+	// — proves this is genuinely an average, not just the latest value.
+	if !signals[1].VideoOK || signals[1].Video != 0.55 {
+		t.Errorf("Signals[1].Video = %+v, want 0.55 (mean of 0.9 and 0.2)", signals[1])
+	}
+
+	// By the 6th frame, the window (5) has evicted the first 0.9 —
+	// every remaining frame in the window is 0.2, so the mean should be
+	// back down to exactly 0.2, not still dragged up by the evicted
+	// outlier.
+	final := signals[len(signals)-1]
+	if !final.VideoOK || final.Video != 0.2 {
+		t.Errorf("final Signals.Video = %+v, want 0.2 (the 0.9 outlier has scrolled out of the window)", final)
 	}
 }
 
