@@ -127,9 +127,24 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	sessionRepo := sessionrepo.NewPostgres(db.Pool)
 	analysisRepo := analysisrepo.NewPostgres(db.Pool)
 	jobsRepo := jobsrepo.NewPostgres(db.Pool)
+
+	// SSRF protection (7.7.4/7.7.5/7.8): one Validator/SafeFetcher shared
+	// by the API boundary (POST /api/v1/analysis, below), the async
+	// worker pools, and both of the older synchronous pipelines
+	// (POST /api/v1/analyze's pool and POST /api/v1/analyze-session's
+	// Service) — see internal/security's package doc. Every one of
+	// them fetches a client-supplied video_url's bytes itself through
+	// this, rather than handing the URL to a Python service to fetch on
+	// its own; the video-detector's /analyze-upload endpoint (as
+	// opposed to its older, still-present /analyze) exists specifically
+	// so nothing but this gateway process ever makes an outbound
+	// request to a client-supplied URL.
+	urlValidator := security.NewValidator()
+	safeFetcher := security.NewSafeFetcher(urlValidator, security.Config{})
+
 	jobQueue := worker.NewQueue(redisClient.Client, cfg.WorkerQueueSize)
 	jobStore := worker.NewStore(redisClient.Client, cfg.JobTTL)
-	pool := worker.NewPool(jobQueue, jobStore, detectorClient, logger)
+	pool := worker.NewPool(jobQueue, jobStore, safeFetcher, detectorClient, logger)
 	pool.Start(cfg.WorkerCount)
 
 	// Phase 7.5's async analysis worker pools — separate queues, keys,
@@ -154,18 +169,6 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		logger.Info("recovered stale audio jobs from a previous run", slog.Int("count", n))
 	}
 
-	// SSRF protection (7.7.4/7.7.5): one Validator shared by the API
-	// boundary (POST /api/v1/analysis, below) and every worker fetch —
-	// see internal/security's package doc for why both matter. Both
-	// VideoHandler and AudioHandler now fetch their own bytes through a
-	// SafeFetcher-backed SafeURLFetcher rather than handing a URL to a
-	// Python service to fetch itself: the video-detector's
-	// /analyze-upload endpoint (as opposed to its older, still-present
-	// /analyze) takes bytes precisely so this worker is the only thing
-	// that ever makes an outbound request to a client-supplied URL.
-	urlValidator := security.NewValidator()
-	safeFetcher := security.NewSafeFetcher(urlValidator, security.Config{})
-
 	completionCoordinator := analysisworker.NewCoordinator(jobsRepo)
 	videoFetcher := analysisworker.NewSafeURLFetcher(safeFetcher, analysisworker.MaxVideoFetchBytes, []string{"video/"})
 	videoHandler := analysisworker.NewVideoHandler(videoFetcher, detectorClient, analysisRepo, completionCoordinator)
@@ -179,7 +182,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	audioWorkers.Start(workersCtx)
 
 	temporalAnalyzer := temporal.NewAnalyzer()
-	sessionService := session.NewService(detectorClient, audioClient, temporalAnalyzer, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
+	sessionService := session.NewService(safeFetcher, detectorClient, audioClient, temporalAnalyzer, cfg.DetectorTimeout, cfg.AudioDetectorTimeout)
 	riskEngine := risk.NewEngine()
 	realtimeCfg := realtime.Config{
 		MaxVideoQueue:      cfg.RealtimeMaxVideoQueue,

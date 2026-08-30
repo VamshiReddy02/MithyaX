@@ -145,7 +145,7 @@ func TestServer_Routes(t *testing.T) {
 	}
 
 	resp3 := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/analyze", "application/json",
-		strings.NewReader(`{"video_url":"https://example.com/video.mp4"}`),
+		strings.NewReader(`{"video_url":"http://127.0.0.1:1/video.mp4"}`),
 	)
 	defer resp3.Body.Close()
 	if resp3.StatusCode != http.StatusAccepted {
@@ -160,9 +160,19 @@ func TestServer_Routes(t *testing.T) {
 		t.Fatal("queued.ID is empty")
 	}
 
-	// Poll the status endpoint until the worker pool actually completes
-	// the job — proves the full enqueue -> worker -> detector -> store
-	// -> GET path works end to end, not just that POST returns 202.
+	// Poll the status endpoint until the worker pool finishes with the
+	// job. video_url is a loopback address, which the real SafeFetcher
+	// this server wires in (7.8) must reject before ever reaching the
+	// fake detector — the job should reach "failed" with an SSRF-blocked
+	// error, proving the full enqueue -> worker -> SafeFetcher -> store
+	// -> GET path works end to end, and that the SSRF gap 7.8 closed for
+	// this legacy endpoint is actually wired in, not just that POST
+	// returns 202. (fakeDetector's own JSON-decoding wiring is exercised
+	// directly by internal/worker's unit tests, which use a fake fetcher
+	// to reach it — a real fetch through this test's process can't
+	// exercise that path too, since SafeFetcher always rejects loopback
+	// and private addresses by design, and there's no real public origin
+	// this test can depend on.)
 	deadline := time.Now().Add(2 * time.Second)
 	var status handlers.JobStatusResponse
 	for time.Now().Before(deadline) {
@@ -173,17 +183,17 @@ func TestServer_Routes(t *testing.T) {
 		}
 		resp4.Body.Close()
 
-		if status.Status == "completed" {
+		if status.Status == "failed" {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if status.Status != "completed" {
-		t.Fatalf("job status = %q, want %q (last seen: %+v)", status.Status, "completed", status)
+	if status.Status != "failed" {
+		t.Fatalf("job status = %q, want %q (last seen: %+v)", status.Status, "failed", status)
 	}
-	if status.Result == nil || status.Result.Verdict != "fake" {
-		t.Errorf("Result = %+v, want Verdict=fake", status.Result)
+	if !strings.Contains(status.Error, "blocked by SSRF validation") {
+		t.Errorf("job Error = %q, want it to mention SSRF blocking", status.Error)
 	}
 
 	resp5 := doAuthed(t, http.MethodGet, ts.URL+"/api/v1/analyze/does-not-exist", "", nil)

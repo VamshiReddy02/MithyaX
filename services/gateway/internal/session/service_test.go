@@ -9,9 +9,32 @@ import (
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
 	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
 )
+
+// fakeFetcher stands in for *security.SafeFetcher — Service's video
+// branch is a thin fetch-then-analyze adapter (7.8), and
+// internal/security's own tests already exhaustively cover
+// SafeFetcher's real SSRF/timeout/redirect/size behavior. Every test
+// in this file that isn't specifically about the fetch step itself
+// uses defaultFetcher, a fixed always-succeeds instance, so it never
+// needs touching at each of this file's many session.NewService call
+// sites.
+type fakeFetcher struct {
+	data []byte
+	err  error
+}
+
+func (f *fakeFetcher) Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &security.Response{Body: f.data}, nil
+}
+
+var defaultFetcher = &fakeFetcher{data: []byte("video-bytes")}
 
 // fakeVideoAnalyzer and fakeAudioAnalyzer are controllable: an optional
 // delay (to test concurrency/timeouts), a canned result or error, and a
@@ -24,7 +47,7 @@ type fakeVideoAnalyzer struct {
 	called bool
 }
 
-func (f *fakeVideoAnalyzer) Analyze(ctx context.Context, videoURL string) (*detector.Result, error) {
+func (f *fakeVideoAnalyzer) AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error) {
 	f.called = true
 	select {
 	case <-time.After(f.delay):
@@ -114,7 +137,7 @@ func someFrameMetadata() []detector.FrameMetadata {
 func TestService_BothSucceed(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.08, Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.91, Verdict: "fake"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -144,7 +167,7 @@ func TestService_BothSucceed(t *testing.T) {
 func TestService_VideoFailsAudioSucceeds_IsPartial(t *testing.T) {
 	video := &fakeVideoAnalyzer{err: errors.New("video detector unreachable")}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.2, Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -165,10 +188,47 @@ func TestService_VideoFailsAudioSucceeds_IsPartial(t *testing.T) {
 	}
 }
 
+// TestService_VideoFetchBlockedBySSRFValidation is 7.8's closure test:
+// video_url now goes through URLFetcher (a real SafeFetcher in
+// production) before the video-detector ever sees anything — a
+// blocked fetch surfaces as VideoError, exactly like a detector
+// failure already does, and the video-detector is never called at
+// all.
+func TestService_VideoFetchBlockedBySSRFValidation(t *testing.T) {
+	blockedErr := &security.FetchError{Kind: security.FetchErrorBlocked, Message: "blocked by SSRF validation: URL resolves to a non-public address: 127.0.0.1"}
+	fetcher := &fakeFetcher{err: blockedErr}
+	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.1, Verdict: "real"}} // should never be reached
+	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.2, Verdict: "real"}}
+	svc := session.NewService(fetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+
+	req := fullRequest()
+	req.VideoURL = "http://127.0.0.1:5432/"
+	got, err := svc.Analyze(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+
+	if got.Status != session.StatusPartial {
+		t.Errorf("Status = %q, want %q", got.Status, session.StatusPartial)
+	}
+	if got.Video != nil {
+		t.Errorf("Video = %+v, want nil", got.Video)
+	}
+	if got.VideoError == "" {
+		t.Error("VideoError is empty, want the blocked-fetch error surfaced")
+	}
+	if video.called {
+		t.Error("the video-detector was called despite the fetch being blocked")
+	}
+	if got.Audio == nil || got.Audio.Verdict != "real" {
+		t.Errorf("Audio = %+v, want Verdict=real (must survive video's failure)", got.Audio)
+	}
+}
+
 func TestService_AudioFailsVideoSucceeds_IsPartial(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.1, Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{err: errors.New("audio detector unreachable")}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -192,7 +252,7 @@ func TestService_AudioFailsVideoSucceeds_IsPartial(t *testing.T) {
 func TestService_BothFail_IsFailed(t *testing.T) {
 	video := &fakeVideoAnalyzer{err: errors.New("video boom")}
 	audioClient := &fakeAudioAnalyzer{err: errors.New("audio boom")}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -210,7 +270,7 @@ func TestService_BothFail_IsFailed(t *testing.T) {
 func TestService_OnlyVideoRequested_SkipsAudio(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.1, Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.5, Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{VideoURL: "https://example.com/clip.mp4"})
 	if err != nil {
@@ -231,7 +291,7 @@ func TestService_OnlyVideoRequested_SkipsAudio(t *testing.T) {
 func TestService_OnlyAudioRequested_SkipsVideo(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.1, Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.5, Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{
 		AudioFilename: "clip.wav",
@@ -259,7 +319,7 @@ func TestService_RunsVideoAndAudioConcurrently(t *testing.T) {
 	const delay = 150 * time.Millisecond
 	video := &fakeVideoAnalyzer{delay: delay, result: &detector.Result{Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{delay: delay, result: &audio.Result{Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Second, time.Second)
 
 	start := time.Now()
 	_, err := svc.Analyze(context.Background(), fullRequest())
@@ -280,7 +340,7 @@ func TestService_RunsVideoAndAudioConcurrently(t *testing.T) {
 func TestService_TimeoutsAreIndependent(t *testing.T) {
 	video := &fakeVideoAnalyzer{delay: 200 * time.Millisecond, result: &detector.Result{Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{delay: 10 * time.Millisecond, result: &audio.Result{Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, 50*time.Millisecond, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, 50*time.Millisecond, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -304,7 +364,7 @@ func TestService_TimeoutsAreIndependent(t *testing.T) {
 func TestService_ParentCancellationStopsBothBranchesPromptly(t *testing.T) {
 	video := &fakeVideoAnalyzer{delay: 10 * time.Second, result: &detector.Result{Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{delay: 10 * time.Second, result: &audio.Result{Verdict: "real"}}
-	svc := session.NewService(video, audioClient, &fakeTemporalAnalyzer{}, time.Minute, time.Minute)
+	svc := session.NewService(defaultFetcher, video, audioClient, &fakeTemporalAnalyzer{}, time.Minute, time.Minute)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -338,7 +398,7 @@ func TestService_TemporalNotRequested_SkipsAnalyzer(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{Verdict: "real"}}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.9}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -369,7 +429,7 @@ func TestService_TemporalRequested_IncludedInSession(t *testing.T) {
 		ScoreVariance:   0.05,
 		Reasons:         []string{"stub temporal reason"},
 	}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{
 		VideoURL:      "https://example.com/clip.mp4",
@@ -403,7 +463,7 @@ func TestService_TemporalOnly(t *testing.T) {
 	video := &fakeVideoAnalyzer{}
 	audioClient := &fakeAudioAnalyzer{}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.3, FramesAnalyzed: 2}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{Frames: someFrames()})
 	if err != nil {
@@ -431,7 +491,7 @@ func TestService_VideoFailsTemporalSucceeds_IsPartial(t *testing.T) {
 	video := &fakeVideoAnalyzer{err: errors.New("video detector unreachable")}
 	audioClient := &fakeAudioAnalyzer{}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.1, FramesAnalyzed: 2}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{
 		VideoURL: "https://example.com/clip.mp4",
@@ -465,7 +525,7 @@ func TestService_VideoFrameMetadata_DrivesTemporal(t *testing.T) {
 	}}
 	audioClient := &fakeAudioAnalyzer{}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.55, FramesAnalyzed: 2}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{
 		VideoURL: "https://example.com/clip.mp4",
@@ -512,7 +572,7 @@ func TestService_VideoAudioTemporal_AllThreeSucceed(t *testing.T) {
 	}}
 	audioClient := &fakeAudioAnalyzer{result: &audio.Result{FakeScore: 0.91, Verdict: "fake"}}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.4, FramesAnalyzed: 2}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), fullRequest())
 	if err != nil {
@@ -545,7 +605,7 @@ func TestService_VideoSucceeds_NoFrameMetadata_SkipsTemporal(t *testing.T) {
 	video := &fakeVideoAnalyzer{result: &detector.Result{FakeScore: 0.2, Verdict: "real"}}
 	audioClient := &fakeAudioAnalyzer{}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.9}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	got, err := svc.Analyze(context.Background(), session.AnalyzeRequest{
 		VideoURL: "https://example.com/clip.mp4",
@@ -579,7 +639,7 @@ func TestService_ReqFramesOverridesVideoFrameMetadata(t *testing.T) {
 	}}
 	audioClient := &fakeAudioAnalyzer{}
 	temporalAnalyzer := &fakeTemporalAnalyzer{result: &temporal.TemporalResult{Score: 0.2}}
-	svc := session.NewService(video, audioClient, temporalAnalyzer, time.Second, time.Second)
+	svc := session.NewService(defaultFetcher, video, audioClient, temporalAnalyzer, time.Second, time.Second)
 
 	override := []temporal.Frame{{Timestamp: 0, FakeScore: 0.5, FaceDetected: true}}
 

@@ -9,8 +9,28 @@ import (
 	"time"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 	"github.com/vamshireddy02/mithyax/gateway/internal/worker"
 )
+
+// fakeFetcher stands in for *security.SafeFetcher — Pool is a thin
+// fetch-then-analyze adapter (7.8), and internal/security's own tests
+// already exhaustively cover SafeFetcher's real SSRF/timeout/redirect/
+// size behavior, so these tests only need a controllable stand-in:
+// canned bytes on success, or an injected error (e.g. a
+// *security.FetchError, to prove Pool classifies a blocked fetch as
+// non-retryable the same way a KindInvalidVideo detector error is).
+type fakeFetcher struct {
+	data []byte
+	err  error
+}
+
+func (f *fakeFetcher) Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &security.Response{Body: f.data}, nil
+}
 
 // callResult is one canned outcome for fakeClient.Analyze, consumed in
 // order as calls come in; the last entry repeats once exhausted.
@@ -31,7 +51,7 @@ type fakeClient struct {
 	panicOn int // if > 0, panic on this call number (1-indexed)
 }
 
-func (f *fakeClient) Analyze(ctx context.Context, videoURL string) (*detector.Result, error) {
+func (f *fakeClient) AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error) {
 	f.mu.Lock()
 	f.calls++
 	n := f.calls
@@ -62,12 +82,22 @@ func (f *fakeClient) callCount() int {
 	return f.calls
 }
 
+// newPool builds a Pool with a fetcher that always succeeds with
+// canned bytes — the right default for every test in this file that's
+// actually about detector-level behavior (retry, panic recovery,
+// shutdown, ...), not the fetch step itself. See
+// newPoolWithFetcher for tests that need to control fetching too.
 func newPool(t *testing.T, client worker.DetectorClient, queueSize int) (*worker.Pool, *worker.Store) {
+	t.Helper()
+	return newPoolWithFetcher(t, &fakeFetcher{data: []byte("video-bytes")}, client, queueSize)
+}
+
+func newPoolWithFetcher(t *testing.T, fetcher worker.URLFetcher, client worker.DetectorClient, queueSize int) (*worker.Pool, *worker.Store) {
 	t.Helper()
 	redisClient := newTestRedis(t)
 	queue := worker.NewQueue(redisClient, queueSize)
 	store := worker.NewStore(redisClient, time.Hour)
-	return worker.NewPool(queue, store, client, testLogger()), store
+	return worker.NewPool(queue, store, fetcher, client, testLogger()), store
 }
 
 func waitForStatus(t *testing.T, store *worker.Store, id string, want worker.Status, timeout time.Duration) worker.Job {
@@ -206,6 +236,85 @@ func TestPool_NonRetryableErrorFailsImmediately(t *testing.T) {
 	}
 }
 
+// --- fetch step (7.8) ---
+
+// TestPool_FetchBlockedBySSRFValidation_FailsImmediately proves the
+// gap this phase closed: video_url now goes through URLFetcher (a
+// real SafeFetcher in production) before the detector ever sees
+// anything, and a blocked fetch is treated as permanent — the same
+// "don't retry what can't succeed" rule KindInvalidVideo already gets
+// — so the detector is never even called.
+func TestPool_FetchBlockedBySSRFValidation_FailsImmediately(t *testing.T) {
+	blockedErr := &security.FetchError{Kind: security.FetchErrorBlocked, Message: "blocked by SSRF validation"}
+	fetcher := &fakeFetcher{err: blockedErr}
+	client := &fakeClient{results: []callResult{{result: &detector.Result{Verdict: "real"}}}} // should never be reached
+	pool, store := newPoolWithFetcher(t, fetcher, client, 4)
+	pool.Start(1)
+	defer pool.Shutdown(context.Background())
+
+	job, err := pool.Submit("http://127.0.0.1:5432/")
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	failed := waitForStatus(t, store, job.ID, worker.StatusFailed, time.Second)
+	if failed.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1 (no retry for a blocked fetch)", failed.Attempts)
+	}
+	if client.callCount() != 0 {
+		t.Error("the video-detector was called despite the fetch being blocked")
+	}
+}
+
+// TestPool_FetchTransientError_RetriedThenSucceeds proves a
+// transient fetch failure (unrelated to SSRF — a genuine network
+// blip) is retried, the same way a transient detector error already
+// is, and a subsequent successful fetch lets the job complete
+// normally.
+func TestPool_FetchTransientError_RetriedThenSucceeds(t *testing.T) {
+	fetcher := &sequencedFetcher{errs: []error{
+		&security.FetchError{Kind: security.FetchErrorNetwork, Message: "connection reset"},
+	}, data: []byte("video-bytes")}
+	client := &fakeClient{results: []callResult{{result: &detector.Result{Verdict: "real"}}}}
+	pool, store := newPoolWithFetcher(t, fetcher, client, 4)
+	pool.Start(1)
+	defer pool.Shutdown(context.Background())
+
+	job, err := pool.Submit("https://example.com/v.mp4")
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	completed := waitForStatus(t, store, job.ID, worker.StatusCompleted, 4*time.Second)
+	if completed.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2 (one failed fetch, one successful retry)", completed.Attempts)
+	}
+	if client.callCount() != 1 {
+		t.Errorf("detector called %d times, want exactly 1 (only the successful fetch should have reached it)", client.callCount())
+	}
+}
+
+// sequencedFetcher returns each of errs in order (a transient failure,
+// typically), then succeeds with data for every call after that.
+type sequencedFetcher struct {
+	mu    sync.Mutex
+	errs  []error
+	calls int
+	data  []byte
+}
+
+func (f *sequencedFetcher) Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls < len(f.errs) {
+		err := f.errs[f.calls]
+		f.calls++
+		return nil, err
+	}
+	f.calls++
+	return &security.Response{Body: f.data}, nil
+}
+
 // --- timeout ---
 
 func TestPool_ShutdownTimesOutIfJobHangs(t *testing.T) {
@@ -271,7 +380,7 @@ func TestPool_RedisUnavailable_SubmitFails(t *testing.T) {
 	queue := worker.NewQueue(redisClient, 4)
 	store := worker.NewStore(redisClient, time.Hour)
 	client := &fakeClient{results: []callResult{{result: &detector.Result{}}}}
-	pool := worker.NewPool(queue, store, client, testLogger())
+	pool := worker.NewPool(queue, store, &fakeFetcher{data: []byte("video-bytes")}, client, testLogger())
 
 	_, err := pool.Submit("https://example.com/v.mp4")
 	if !errors.Is(err, worker.ErrRedisUnavailable) {

@@ -9,18 +9,43 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"net/url"
+	"path"
 	"time"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
 )
 
-// VideoAnalyzer performs a whole-video analysis. detector.Client
-// implements it.
+// VideoAnalyzer performs a whole-video analysis on bytes Service
+// already fetched itself (see URLFetcher). detector.Client implements
+// it via AnalyzeBytes.
 type VideoAnalyzer interface {
-	Analyze(ctx context.Context, videoURL string) (*detector.Result, error)
+	AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error)
 }
+
+// URLFetcher fetches the bytes referenced by a video_url before
+// Service ever hands them to a detector — see security.SafeFetcher,
+// the real implementation. Phase 7.8 closed a gap left open since
+// 7.7.5: video_url used to go straight to the video-detector
+// (Analyze(ctx, videoURL)), which fetched it in its own process,
+// entirely outside SafeFetcher's SSRF/redirect/size/timeout
+// protections. Fetching the bytes here instead — exactly like
+// internal/analysisworker.VideoHandler and internal/worker.Pool
+// already do — closes it for this pipeline too.
+type URLFetcher interface {
+	Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error)
+}
+
+// maxVideoFetchBytes bounds a fetched video file — same limit
+// internal/analysisworker.MaxVideoFetchBytes and internal/worker's own
+// identical constant use. Duplicated rather than imported across these
+// independent packages, matching this codebase's established
+// convention (see internal/worker.Pool's own copy of this same
+// constant and helper).
+const maxVideoFetchBytes = 100 << 20 // 100MiB
 
 // AudioAnalyzer performs a whole-file audio analysis. audio.Client
 // implements it.
@@ -55,6 +80,7 @@ type AnalyzeRequest struct {
 // does need to wait, since its usual source of frames is video's own
 // per-frame output (see framesForTemporal).
 type Service struct {
+	videoFetcher     URLFetcher
 	videoClient      VideoAnalyzer
 	audioClient      AudioAnalyzer
 	temporalAnalyzer TemporalAnalyzer
@@ -62,13 +88,17 @@ type Service struct {
 	audioTimeout     time.Duration
 }
 
-// NewService builds a Service. videoTimeout and audioTimeout bound each
-// remote branch independently — video analysis is typically much slower
-// than audio, so sharing one timeout would either starve audio's budget
-// or let a hanging video call run far longer than audio ever should.
-// Temporal analysis has no timeout since it never calls out.
-func NewService(videoClient VideoAnalyzer, audioClient AudioAnalyzer, temporalAnalyzer TemporalAnalyzer, videoTimeout, audioTimeout time.Duration) *Service {
+// NewService builds a Service. videoFetcher is, in production, always
+// a real *security.SafeFetcher — see URLFetcher's own doc for why
+// video_url goes through it before videoClient ever sees any bytes.
+// videoTimeout and audioTimeout bound each remote branch independently
+// — video analysis is typically much slower than audio, so sharing one
+// timeout would either starve audio's budget or let a hanging video
+// call run far longer than audio ever should. Temporal analysis has no
+// timeout since it never calls out.
+func NewService(videoFetcher URLFetcher, videoClient VideoAnalyzer, audioClient AudioAnalyzer, temporalAnalyzer TemporalAnalyzer, videoTimeout, audioTimeout time.Duration) *Service {
 	return &Service{
+		videoFetcher:     videoFetcher,
 		videoClient:      videoClient,
 		audioClient:      audioClient,
 		temporalAnalyzer: temporalAnalyzer,
@@ -148,7 +178,15 @@ func (s *Service) Analyze(ctx context.Context, req AnalyzeRequest) (*AnalysisSes
 }
 
 func (s *Service) runVideo(ctx context.Context, videoURL string) videoOutcome {
-	result, err := s.videoClient.Analyze(ctx, videoURL)
+	resp, err := s.videoFetcher.Fetch(ctx, videoURL, security.FetchOptions{
+		MaxBytes:            maxVideoFetchBytes,
+		AllowedContentTypes: []string{"video/"},
+	})
+	if err != nil {
+		return videoOutcome{err: err}
+	}
+
+	result, err := s.videoClient.AnalyzeBytes(ctx, filenameFromURL(videoURL), resp.Body)
 	if err != nil {
 		return videoOutcome{err: err}
 	}
@@ -156,6 +194,26 @@ func (s *Service) runVideo(ctx context.Context, videoURL string) videoOutcome {
 		result:        &VideoResult{FakeScore: result.FakeScore, Verdict: result.Verdict},
 		frameMetadata: result.FrameMetadata,
 	}
+}
+
+// filenameFromURL extracts a file name (with extension) from a URL's
+// path — the video-detector uses it to infer the container format, the
+// same way its /analyze endpoint always could from video_url directly.
+// Duplicated from internal/worker's and internal/analysisworker's
+// identical helper (see this package's own doc on URLFetcher for why
+// importing across these independent packages isn't done just for
+// this).
+func filenameFromURL(rawURL string) string {
+	const fallback = "video.mp4"
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fallback
+	}
+	name := path.Base(parsed.Path)
+	if name == "" || name == "." || name == "/" {
+		return fallback
+	}
+	return name
 }
 
 func (s *Service) runAudio(ctx context.Context, filename string, data []byte) audioOutcome {

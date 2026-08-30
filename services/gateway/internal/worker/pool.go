@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"path"
 	"sync"
 	"time"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
+	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 )
 
 // ErrPoolClosed is returned by Submit once Shutdown has been called.
@@ -24,21 +27,44 @@ const maxAttempts = 3
 // attempt 1 waits retryBaseDelay, attempt 2 waits 2*retryBaseDelay, etc.
 const retryBaseDelay = 500 * time.Millisecond
 
-// DetectorClient analyzes a video. detector.Client implements it; tests
-// can supply a fake.
+// DetectorClient analyzes video bytes this Pool already fetched itself
+// (see URLFetcher) — detector.Client implements it via AnalyzeBytes;
+// tests can supply a fake.
 type DetectorClient interface {
-	Analyze(ctx context.Context, videoURL string) (*detector.Result, error)
+	AnalyzeBytes(ctx context.Context, filename string, data []byte) (*detector.Result, error)
 }
+
+// URLFetcher fetches the bytes referenced by a video_url before this
+// Pool ever hands them to a detector — see security.SafeFetcher, the
+// real implementation. Phase 7.8 closed a gap this package had left
+// open since 7.7.5: video_url used to go straight to the video-detector
+// (Analyze(ctx, videoURL)), which fetched it in its own process,
+// entirely outside SafeFetcher's SSRF/redirect/size/timeout
+// protections — the same shape of hole 7.7.5 closed for the async
+// analysis pipeline, just still open here. Fetching the bytes in this
+// process instead — exactly like internal/analysisworker.VideoHandler
+// already does — closes it for this older, synchronous pipeline too.
+type URLFetcher interface {
+	Fetch(ctx context.Context, rawURL string, opts security.FetchOptions) (*security.Response, error)
+}
+
+// maxVideoFetchBytes bounds a fetched video file — same limit
+// internal/analysisworker.MaxVideoFetchBytes uses for the async
+// pipeline's identical fetch. Duplicated rather than imported across
+// these two independent worker packages (see this package's own doc
+// for why they stay separate).
+const maxVideoFetchBytes = 100 << 20 // 100MiB
 
 // Pool runs a fixed number of worker goroutines that pull job IDs off a
 // Redis-backed Queue and run them against the video-detector, recording
 // each job's progress and result in a Redis-backed Store.
 type Pool struct {
-	queue  *Queue
-	store  *Store
-	client DetectorClient
-	logger *slog.Logger
-	wg     sync.WaitGroup
+	queue   *Queue
+	store   *Store
+	fetcher URLFetcher
+	client  DetectorClient
+	logger  *slog.Logger
+	wg      sync.WaitGroup
 
 	mu         sync.Mutex
 	closed     bool
@@ -46,12 +72,16 @@ type Pool struct {
 	cancelWork context.CancelFunc
 }
 
-// NewPool builds a Pool. Call Start to launch its workers.
-func NewPool(queue *Queue, store *Store, client DetectorClient, logger *slog.Logger) *Pool {
+// NewPool builds a Pool. Call Start to launch its workers. fetcher is,
+// in production, always a real *security.SafeFetcher — see this
+// package's own doc on URLFetcher for why every video_url now goes
+// through it before ever reaching client.
+func NewPool(queue *Queue, store *Store, fetcher URLFetcher, client DetectorClient, logger *slog.Logger) *Pool {
 	workCtx, cancel := context.WithCancel(context.Background())
 	return &Pool{
 		queue:      queue,
 		store:      store,
+		fetcher:    fetcher,
 		client:     client,
 		logger:     logger,
 		workCtx:    workCtx,
@@ -129,7 +159,7 @@ func (p *Pool) process(job Job) {
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		job.Attempts = attempt
-		result, lastErr = p.client.Analyze(context.Background(), job.VideoURL)
+		result, lastErr = p.fetchAndAnalyze(context.Background(), job.VideoURL)
 		if lastErr == nil {
 			break
 		}
@@ -164,14 +194,54 @@ func (p *Pool) process(job Job) {
 	}
 }
 
-// isRetryable reports whether a failed detector call is worth retrying.
-// An invalid video (corrupt file, unreachable URL, unsupported format)
-// will fail identically on every retry, so those aren't retried; timeouts
-// and connectivity/server errors are transient and are.
+// fetchAndAnalyze fetches videoURL through fetcher (SSRF-validated,
+// size-bounded, redirect-safe — see URLFetcher) and hands the
+// resulting bytes to client. A fetch failure never reaches the
+// detector at all, the same way internal/analysisworker.VideoHandler's
+// identical two-step call already works.
+func (p *Pool) fetchAndAnalyze(ctx context.Context, videoURL string) (*detector.Result, error) {
+	resp, err := p.fetcher.Fetch(ctx, videoURL, security.FetchOptions{
+		MaxBytes:            maxVideoFetchBytes,
+		AllowedContentTypes: []string{"video/"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return p.client.AnalyzeBytes(ctx, filenameFromURL(videoURL), resp.Body)
+}
+
+// filenameFromURL extracts a file name (with extension) from a URL's
+// path — the video-detector uses it to infer the container format, the
+// same way its /analyze endpoint always could from video_url directly.
+// Duplicated from internal/analysisworker's identical helper (see this
+// package's own doc for why importing across these two independent
+// worker packages isn't done just for this).
+func filenameFromURL(rawURL string) string {
+	const fallback = "video.mp4"
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fallback
+	}
+	name := path.Base(parsed.Path)
+	if name == "" || name == "." || name == "/" {
+		return fallback
+	}
+	return name
+}
+
+// isRetryable reports whether a failed fetch-or-detector call is worth
+// retrying. An invalid video (corrupt file, unsupported format) or a
+// blocked/oversized/wrong-content-type fetch will fail identically on
+// every retry, so those aren't retried; timeouts and connectivity/
+// server errors on either side are transient and are.
 func isRetryable(err error) bool {
 	var derr *detector.Error
 	if errors.As(err, &derr) {
 		return derr.Kind != detector.KindInvalidVideo
+	}
+	var ferr *security.FetchError
+	if errors.As(err, &ferr) {
+		return !ferr.IsPermanent()
 	}
 	return true
 }
