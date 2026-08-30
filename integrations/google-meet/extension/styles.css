@@ -1,4 +1,4 @@
-#mithyax-badge {
+.mithyax-badge {
   position: fixed;
   top: 12px;
   left: 12px;
@@ -15,18 +15,18 @@
   pointer-events: none;
 }
 
-#mithyax-badge .mithyax-label {
+.mithyax-badge .mithyax-label {
   opacity: 0.7;
 }
 
-#mithyax-badge[data-tier="real"] {
+.mithyax-badge[data-tier="real"] {
   background: rgba(20, 60, 30, 0.9);
 }
 
-#mithyax-badge[data-tier="suspicious"] {
+.mithyax-badge[data-tier="suspicious"] {
   background: rgba(70, 55, 10, 0.9);
 }
 
-#mithyax-badge[data-tier="fake"] {
+.mithyax-badge[data-tier="fake"] {
   background: rgba(70, 20, 20, 0.9);
 }
