@@ -10,14 +10,17 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	gorilla "github.com/gorilla/websocket"
 
 	"github.com/vamshireddy02/mithyax/gateway/internal/audio"
 	"github.com/vamshireddy02/mithyax/gateway/internal/config"
+	"github.com/vamshireddy02/mithyax/gateway/internal/database"
 	"github.com/vamshireddy02/mithyax/gateway/internal/detector"
 	"github.com/vamshireddy02/mithyax/gateway/internal/handlers"
 	"github.com/vamshireddy02/mithyax/gateway/internal/httpserver"
@@ -29,8 +32,9 @@ import (
 // them, since that whole group now requires authentication; /health
 // does not (see its own request below).
 const (
-	testAuthToken      = "test-server-auth-token"
-	testAdminAuthToken = "test-server-admin-auth-token"
+	testAuthToken          = "test-server-auth-token"
+	testAdminAuthToken     = "test-server-admin-auth-token"
+	testExtensionAuthToken = "test-server-extension-auth-token"
 )
 
 // doAuthed sends an authenticated request to url — a plain http.Get/
@@ -86,18 +90,20 @@ func TestServer_Routes(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := httpserver.New(config.Config{
-		Port:                 "0",
-		Environment:          "test",
-		DetectorBaseURL:      fakeDetector.URL,
-		DetectorTimeout:      5 * time.Second,
-		AudioDetectorBaseURL: fakeAudioDetector.URL,
-		AudioDetectorTimeout: 5 * time.Second,
-		WorkerCount:          2,
-		WorkerQueueSize:      8,
-		RedisURL:             "redis://" + mr.Addr(),
-		JobTTL:               time.Hour,
-		AuthToken:            testAuthToken,
-		AdminAuthToken:       testAdminAuthToken,
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorBaseURL:               fakeDetector.URL,
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorBaseURL:          fakeAudioDetector.URL,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   2,
+		WorkerQueueSize:               8,
+		RedisURL:                      "redis://" + mr.Addr(),
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -248,16 +254,18 @@ func TestServer_AuthWiring(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := httpserver.New(config.Config{
-		Port:                 "0",
-		Environment:          "test",
-		DetectorTimeout:      5 * time.Second,
-		AudioDetectorTimeout: 5 * time.Second,
-		WorkerCount:          1,
-		WorkerQueueSize:      1,
-		RedisURL:             "redis://" + mr.Addr(),
-		JobTTL:               time.Hour,
-		AuthToken:            testAuthToken,
-		AdminAuthToken:       testAdminAuthToken,
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   1,
+		WorkerQueueSize:               1,
+		RedisURL:                      "redis://" + mr.Addr(),
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -372,16 +380,18 @@ func TestServer_RateLimitWiring(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := httpserver.New(config.Config{
-		Port:                 "0",
-		Environment:          "test",
-		DetectorTimeout:      5 * time.Second,
-		AudioDetectorTimeout: 5 * time.Second,
-		WorkerCount:          1,
-		WorkerQueueSize:      1,
-		RedisURL:             "redis://" + mr.Addr(),
-		JobTTL:               time.Hour,
-		AuthToken:            testAuthToken,
-		AdminAuthToken:       testAdminAuthToken,
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   1,
+		WorkerQueueSize:               1,
+		RedisURL:                      "redis://" + mr.Addr(),
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -468,16 +478,18 @@ func TestServer_SSRFProtection_CannotBypass(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := httpserver.New(config.Config{
-		Port:                 "0",
-		Environment:          "test",
-		DetectorTimeout:      5 * time.Second,
-		AudioDetectorTimeout: 5 * time.Second,
-		WorkerCount:          1,
-		WorkerQueueSize:      1,
-		RedisURL:             "redis://" + mr.Addr(),
-		JobTTL:               time.Hour,
-		AuthToken:            testAuthToken,
-		AdminAuthToken:       testAdminAuthToken,
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   1,
+		WorkerQueueSize:               1,
+		RedisURL:                      "redis://" + mr.Addr(),
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -552,16 +564,18 @@ func TestServer_RequestBodyLimitWiring(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := httpserver.New(config.Config{
-		Port:                 "0",
-		Environment:          "test",
-		DetectorTimeout:      5 * time.Second,
-		AudioDetectorTimeout: 5 * time.Second,
-		WorkerCount:          1,
-		WorkerQueueSize:      1,
-		RedisURL:             "redis://" + mr.Addr(),
-		JobTTL:               time.Hour,
-		AuthToken:            testAuthToken,
-		AdminAuthToken:       testAdminAuthToken,
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   1,
+		WorkerQueueSize:               1,
+		RedisURL:                      "redis://" + mr.Addr(),
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -623,10 +637,12 @@ func TestServer_PostgresUnavailable_AnalysisAPIFailsSafely(t *testing.T) {
 		// Nothing is listening here — pgxpool connects lazily, so
 		// httpserver.New itself succeeds; the failure surfaces the
 		// first time a query actually runs, exactly like a real outage.
-		DatabaseURL:    "postgres://user:pass@127.0.0.1:1/nonexistent?connect_timeout=1",
-		JobTTL:         time.Hour,
-		AuthToken:      testAuthToken,
-		AdminAuthToken: testAdminAuthToken,
+		DatabaseURL:                   "postgres://user:pass@127.0.0.1:1/nonexistent?connect_timeout=1",
+		JobTTL:                        time.Hour,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
 	}, logger)
 	if err != nil {
 		t.Fatalf("httpserver.New() error = %v", err)
@@ -663,5 +679,220 @@ func TestServer_PostgresUnavailable_AnalysisAPIFailsSafely(t *testing.T) {
 		if len(entries) != 0 {
 			t.Error("a job was enqueued into Redis despite the Postgres write failing")
 		}
+	}
+}
+
+// TestServer_ExtensionSessionAuth drives the whole Phase 8.1 flow end
+// to end: the Chrome extension's own token (never AuthToken or
+// AdminAuthToken) authenticates only POST /api/v1/auth/session, which
+// mints a short-lived credential; that credential — not the extension
+// token itself — is what actually creates a session and connects its
+// WebSocket. Every negative case here is exactly the property 8.1
+// exists to guarantee: the extension token has no reach beyond
+// /auth/session, and a session credential has no reach beyond
+// /sessions and /sessions/ws.
+func TestServer_ExtensionSessionAuth(t *testing.T) {
+	// POST /api/v1/sessions writes through to PostgreSQL (see
+	// handlers.NewCreateSession) — unlike TestServer_AuthWiring and
+	// friends, which never actually issue a query, this test needs a
+	// real, migrated database. Same opt-in convention as
+	// internal/repository/sessions's own tests: skip, don't fail, if
+	// GATEWAY_TEST_DATABASE_URL isn't set or nothing is reachable there,
+	// so `go test ./...` stays green without Docker/Postgres running.
+	testDatabaseURL := os.Getenv("GATEWAY_TEST_DATABASE_URL")
+	if testDatabaseURL == "" {
+		t.Skip("GATEWAY_TEST_DATABASE_URL not set; skipping test that needs a real PostgreSQL instance (see deployments/docker/.env.example)")
+	}
+	db, err := database.New(context.Background(), testDatabaseURL)
+	if err != nil {
+		t.Fatalf("database.New() error = %v", err)
+	}
+	defer db.Close()
+	healthCtx, healthCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer healthCancel()
+	if err := db.HealthCheck(healthCtx); err != nil {
+		t.Skipf("PostgreSQL not reachable at %s: %v", testDatabaseURL, err)
+	}
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run() error = %v", err)
+	}
+	defer mr.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := httpserver.New(config.Config{
+		Port:                          "0",
+		Environment:                   "test",
+		DetectorTimeout:               5 * time.Second,
+		AudioDetectorTimeout:          5 * time.Second,
+		WorkerCount:                   1,
+		WorkerQueueSize:               1,
+		RedisURL:                      "redis://" + mr.Addr(),
+		DatabaseURL:                   testDatabaseURL,
+		JobTTL:                        time.Hour,
+		RealtimeMaxSessions:           10,
+		AuthToken:                     testAuthToken,
+		AdminAuthToken:                testAdminAuthToken,
+		ExtensionAuthToken:            testExtensionAuthToken,
+		ExtensionSessionCredentialTTL: time.Hour,
+	}, logger)
+	if err != nil {
+		t.Fatalf("httpserver.New() error = %v", err)
+	}
+	defer srv.Redis.Close()
+	defer srv.StopWorkers()
+	defer srv.Pool.Shutdown(context.Background())
+
+	ts := httptest.NewServer(srv.HTTP.Handler)
+	defer ts.Close()
+
+	// No credential at all: rejected.
+	noAuthResp, err := http.Post(ts.URL+"/api/v1/auth/session", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /api/v1/auth/session (no auth): %v", err)
+	}
+	noAuthResp.Body.Close()
+	if noAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/auth/session with no auth status = %d, want %d", noAuthResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// The gateway's normal user token must NOT mint a session credential
+	// — /auth/session is guarded by ExtensionMiddleware alone, not the
+	// general auth.Middleware/tokens map.
+	userTokenResp := doAuthed(t, http.MethodPost, ts.URL+"/api/v1/auth/session", "", nil)
+	defer userTokenResp.Body.Close()
+	if userTokenResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/auth/session with the normal user token status = %d, want %d", userTokenResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// The extension's own token mints a credential.
+	mintReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/session", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	mintReq.Header.Set("Authorization", "Bearer "+testExtensionAuthToken)
+	mintResp, err := http.DefaultClient.Do(mintReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/auth/session (extension token): %v", err)
+	}
+	defer mintResp.Body.Close()
+	if mintResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/auth/session with the extension token status = %d, want %d", mintResp.StatusCode, http.StatusCreated)
+	}
+	var minted struct {
+		Credential string `json:"credential"`
+		ExpiresAt  string `json:"expires_at"`
+	}
+	if err := json.NewDecoder(mintResp.Body).Decode(&minted); err != nil {
+		t.Fatalf("decode POST /api/v1/auth/session response: %v", err)
+	}
+	if minted.Credential == "" {
+		t.Fatal("minted.Credential is empty")
+	}
+	if minted.ExpiresAt == "" {
+		t.Error("minted.ExpiresAt is empty")
+	}
+
+	// The extension token itself — never exchanged — must not work
+	// anywhere else in the API. /api/v1/analyze's blanket auth.Middleware
+	// doesn't recognize it at all, so this is a 401, not the 400 a
+	// recognized-but-empty-body request would get.
+	extTokenElsewhereReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/analyze", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	extTokenElsewhereReq.Header.Set("Authorization", "Bearer "+testExtensionAuthToken)
+	extTokenElsewhereResp, err := http.DefaultClient.Do(extTokenElsewhereReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/analyze (extension token): %v", err)
+	}
+	defer extTokenElsewhereResp.Body.Close()
+	if extTokenElsewhereResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/analyze with the extension token status = %d, want %d", extTokenElsewhereResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// Nor does the bare extension token satisfy /sessions — only an
+	// actually-minted credential (or a real long-lived token) does.
+	extTokenOnSessionsReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/sessions", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	extTokenOnSessionsReq.Header.Set("Authorization", "Bearer "+testExtensionAuthToken)
+	extTokenOnSessionsResp, err := http.DefaultClient.Do(extTokenOnSessionsReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/sessions (extension token): %v", err)
+	}
+	defer extTokenOnSessionsResp.Body.Close()
+	if extTokenOnSessionsResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/v1/sessions with the bare extension token status = %d, want %d", extTokenOnSessionsResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// The minted credential creates a session.
+	createReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/sessions", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	createReq.Header.Set("Authorization", "Bearer "+minted.Credential)
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/sessions (credential): %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/sessions with the session credential status = %d, want %d", createResp.StatusCode, http.StatusCreated)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode POST /api/v1/sessions response: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatal("created.ID is empty")
+	}
+
+	// A wrong/expired-looking credential must not connect the WebSocket.
+	wrongWSURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/sessions/ws?session_id=" + created.ID + "&credential=not-a-real-credential"
+	_, wrongResp, wrongErr := gorilla.DefaultDialer.Dial(wrongWSURL, nil)
+	if wrongErr == nil {
+		t.Fatal("dial with a bogus credential succeeded, want it rejected")
+	}
+	if wrongResp == nil || wrongResp.StatusCode != http.StatusUnauthorized {
+		status := -1
+		if wrongResp != nil {
+			status = wrongResp.StatusCode
+		}
+		t.Errorf("dial with a bogus credential: handshake status = %d, want %d", status, http.StatusUnauthorized)
+	}
+
+	// The actual minted credential, presented as the WebSocket's
+	// "credential" query parameter — the only way a browser's WebSocket
+	// API can present it, since it can't attach a header to the upgrade
+	// request — connects successfully.
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/sessions/ws?session_id=" + created.ID + "&credential=" + minted.Credential
+	conn, connResp, err := gorilla.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		status := -1
+		if connResp != nil {
+			status = connResp.StatusCode
+		}
+		t.Fatalf("dial with the real credential failed: %v (status %d)", err, status)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var started struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	if err := conn.ReadJSON(&started); err != nil {
+		t.Fatalf("ReadJSON: %v", err)
+	}
+	if started.Type != "session_started" || started.ID != created.ID {
+		t.Errorf("got %+v, want session_started for %s", started, created.ID)
 	}
 }

@@ -114,32 +114,47 @@ type Config struct {
 	// credential from AuthToken, required the same way and for the same
 	// reason.
 	AdminAuthToken string
+	// ExtensionAuthToken is the shared bearer token auth.ExtensionMiddleware
+	// checks (Phase 8.1) — a third credential, separate from AuthToken and
+	// AdminAuthToken, required the same way and for the same reason. It
+	// authorizes exactly one route, POST /api/v1/auth/session: the Chrome
+	// extension holds only this narrowly-scoped token, never AuthToken or
+	// AdminAuthToken, and exchanges it there for a short-lived session
+	// credential (see internal/sessioncred) to actually reach the API.
+	ExtensionAuthToken string
+	// ExtensionSessionCredentialTTL bounds how long a session credential
+	// POST /api/v1/auth/session issues stays valid — long enough to cover
+	// one Meet call, short enough that a leaked credential (unlike
+	// ExtensionAuthToken itself, or AuthToken/AdminAuthToken) is only ever
+	// a temporary exposure.
+	ExtensionSessionCredentialTTL time.Duration
 }
 
 const (
-	defaultPort                       = "8080"
-	defaultEnvironment                = "development"
-	defaultLogLevel                   = "info"
-	defaultShutdownTimeout            = 10 * time.Second
-	defaultWorkerShutdownTimeout      = 2 * time.Minute
-	defaultDetectorBaseURL            = "http://localhost:8000"
-	defaultDetectorTimeout            = 60 * time.Second
-	defaultAudioDetectorBaseURL       = "http://localhost:8001"
-	defaultAudioDetectorTimeout       = 60 * time.Second
-	defaultWorkerCount                = 4
-	defaultWorkerQueueSize            = 64
-	defaultRedisURL                   = "redis://localhost:6379"
-	defaultJobTTL                     = 24 * time.Hour
-	defaultRealtimeMaxVideoQueue      = 10
-	defaultRealtimeVideoWorkers       = 2
-	defaultRealtimeMaxAudioQueue      = 10
-	defaultRealtimeAudioWorkers       = 2
-	defaultRealtimeMaxSessions        = 100
-	defaultVideoWorkers               = 2
-	defaultAudioWorkers               = 2
-	defaultRealtimeMaxSessionDuration = 60 * time.Minute
-	defaultRealtimeMaxFrames          = 100_000
-	defaultRealtimeMaxAudioChunks     = 50_000
+	defaultPort                          = "8080"
+	defaultEnvironment                   = "development"
+	defaultLogLevel                      = "info"
+	defaultShutdownTimeout               = 10 * time.Second
+	defaultWorkerShutdownTimeout         = 2 * time.Minute
+	defaultDetectorBaseURL               = "http://localhost:8000"
+	defaultDetectorTimeout               = 60 * time.Second
+	defaultAudioDetectorBaseURL          = "http://localhost:8001"
+	defaultAudioDetectorTimeout          = 60 * time.Second
+	defaultWorkerCount                   = 4
+	defaultWorkerQueueSize               = 64
+	defaultRedisURL                      = "redis://localhost:6379"
+	defaultJobTTL                        = 24 * time.Hour
+	defaultRealtimeMaxVideoQueue         = 10
+	defaultRealtimeVideoWorkers          = 2
+	defaultRealtimeMaxAudioQueue         = 10
+	defaultRealtimeAudioWorkers          = 2
+	defaultRealtimeMaxSessions           = 100
+	defaultVideoWorkers                  = 2
+	defaultAudioWorkers                  = 2
+	defaultRealtimeMaxSessionDuration    = 60 * time.Minute
+	defaultRealtimeMaxFrames             = 100_000
+	defaultRealtimeMaxAudioChunks        = 50_000
+	defaultExtensionSessionCredentialTTL = 15 * time.Minute
 )
 
 // Load builds a Config from environment variables, falling back to
@@ -148,32 +163,34 @@ const (
 // explicitly (see deployments/docker/.env.example).
 func Load() (Config, error) {
 	cfg := Config{
-		Port:                       getEnv("GATEWAY_PORT", defaultPort),
-		Environment:                getEnv("GATEWAY_ENV", defaultEnvironment),
-		LogLevel:                   getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
-		ShutdownTimeout:            defaultShutdownTimeout,
-		WorkerShutdownTimeout:      defaultWorkerShutdownTimeout,
-		DetectorBaseURL:            getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
-		DetectorTimeout:            defaultDetectorTimeout,
-		AudioDetectorBaseURL:       getEnv("GATEWAY_AUDIO_DETECTOR_URL", defaultAudioDetectorBaseURL),
-		AudioDetectorTimeout:       defaultAudioDetectorTimeout,
-		WorkerCount:                defaultWorkerCount,
-		WorkerQueueSize:            defaultWorkerQueueSize,
-		RedisURL:                   getEnv("GATEWAY_REDIS_URL", defaultRedisURL),
-		DatabaseURL:                os.Getenv("GATEWAY_DATABASE_URL"),
-		JobTTL:                     defaultJobTTL,
-		RealtimeMaxVideoQueue:      defaultRealtimeMaxVideoQueue,
-		RealtimeVideoWorkers:       defaultRealtimeVideoWorkers,
-		RealtimeMaxAudioQueue:      defaultRealtimeMaxAudioQueue,
-		RealtimeAudioWorkers:       defaultRealtimeAudioWorkers,
-		RealtimeMaxSessions:        defaultRealtimeMaxSessions,
-		RealtimeMaxSessionDuration: defaultRealtimeMaxSessionDuration,
-		RealtimeMaxFrames:          defaultRealtimeMaxFrames,
-		RealtimeMaxAudioChunks:     defaultRealtimeMaxAudioChunks,
-		VideoWorkers:               defaultVideoWorkers,
-		AudioWorkers:               defaultAudioWorkers,
-		AuthToken:                  os.Getenv("GATEWAY_AUTH_TOKEN"),
-		AdminAuthToken:             os.Getenv("GATEWAY_ADMIN_AUTH_TOKEN"),
+		Port:                          getEnv("GATEWAY_PORT", defaultPort),
+		Environment:                   getEnv("GATEWAY_ENV", defaultEnvironment),
+		LogLevel:                      getEnv("GATEWAY_LOG_LEVEL", defaultLogLevel),
+		ShutdownTimeout:               defaultShutdownTimeout,
+		WorkerShutdownTimeout:         defaultWorkerShutdownTimeout,
+		DetectorBaseURL:               getEnv("GATEWAY_DETECTOR_URL", defaultDetectorBaseURL),
+		DetectorTimeout:               defaultDetectorTimeout,
+		AudioDetectorBaseURL:          getEnv("GATEWAY_AUDIO_DETECTOR_URL", defaultAudioDetectorBaseURL),
+		AudioDetectorTimeout:          defaultAudioDetectorTimeout,
+		WorkerCount:                   defaultWorkerCount,
+		WorkerQueueSize:               defaultWorkerQueueSize,
+		RedisURL:                      getEnv("GATEWAY_REDIS_URL", defaultRedisURL),
+		DatabaseURL:                   os.Getenv("GATEWAY_DATABASE_URL"),
+		JobTTL:                        defaultJobTTL,
+		RealtimeMaxVideoQueue:         defaultRealtimeMaxVideoQueue,
+		RealtimeVideoWorkers:          defaultRealtimeVideoWorkers,
+		RealtimeMaxAudioQueue:         defaultRealtimeMaxAudioQueue,
+		RealtimeAudioWorkers:          defaultRealtimeAudioWorkers,
+		RealtimeMaxSessions:           defaultRealtimeMaxSessions,
+		RealtimeMaxSessionDuration:    defaultRealtimeMaxSessionDuration,
+		RealtimeMaxFrames:             defaultRealtimeMaxFrames,
+		RealtimeMaxAudioChunks:        defaultRealtimeMaxAudioChunks,
+		VideoWorkers:                  defaultVideoWorkers,
+		AudioWorkers:                  defaultAudioWorkers,
+		AuthToken:                     os.Getenv("GATEWAY_AUTH_TOKEN"),
+		AdminAuthToken:                os.Getenv("GATEWAY_ADMIN_AUTH_TOKEN"),
+		ExtensionAuthToken:            os.Getenv("GATEWAY_EXTENSION_TOKEN"),
+		ExtensionSessionCredentialTTL: defaultExtensionSessionCredentialTTL,
 	}
 
 	if raw, ok := os.LookupEnv("GATEWAY_SHUTDOWN_TIMEOUT"); ok {
@@ -230,6 +247,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid GATEWAY_JOB_TTL %q: %w", raw, err)
 		}
 		cfg.JobTTL = d
+	}
+
+	if raw, ok := os.LookupEnv("GATEWAY_EXTENSION_SESSION_TTL"); ok {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return Config{}, fmt.Errorf("invalid GATEWAY_EXTENSION_SESSION_TTL %q: must be a positive duration", raw)
+		}
+		cfg.ExtensionSessionCredentialTTL = d
 	}
 
 	var err error
@@ -297,6 +322,10 @@ func Load() (Config, error) {
 
 	if cfg.AdminAuthToken == "" {
 		return Config{}, errors.New("GATEWAY_ADMIN_AUTH_TOKEN is required (see deployments/docker/.env.example)")
+	}
+
+	if cfg.ExtensionAuthToken == "" {
+		return Config{}, errors.New("GATEWAY_EXTENSION_TOKEN is required (see deployments/docker/.env.example)")
 	}
 
 	return cfg, nil

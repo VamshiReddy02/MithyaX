@@ -27,6 +27,7 @@ import (
 	"github.com/vamshireddy02/mithyax/gateway/internal/risk"
 	"github.com/vamshireddy02/mithyax/gateway/internal/security"
 	"github.com/vamshireddy02/mithyax/gateway/internal/session"
+	"github.com/vamshireddy02/mithyax/gateway/internal/sessioncred"
 	"github.com/vamshireddy02/mithyax/gateway/internal/temporal"
 	"github.com/vamshireddy02/mithyax/gateway/internal/websocket"
 	"github.com/vamshireddy02/mithyax/gateway/internal/worker"
@@ -48,6 +49,11 @@ const asyncQueueCapacity = 1000
 const (
 	defaultRateLimit        = 60
 	analysisCreateRateLimit = 10
+	// authSessionRateLimit caps POST /api/v1/auth/session (8.1) tighter
+	// than the whole-API default — minting a credential is cheap, but a
+	// leaked GATEWAY_EXTENSION_TOKEN shouldn't be able to mint an
+	// unbounded number of them either.
+	authSessionRateLimit = 20
 )
 
 // Request body size ceilings (7.7.6). maxRequestBodyBytes is a
@@ -142,6 +148,12 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	urlValidator := security.NewValidator()
 	safeFetcher := security.NewSafeFetcher(urlValidator, security.Config{})
 
+	// Session credentials (8.1): what the Chrome extension actually uses
+	// to reach POST /api/v1/sessions and GET /api/v1/sessions/ws, in
+	// place of ever holding AuthToken/AdminAuthToken — see
+	// internal/sessioncred's package doc and this file's sessionAuth.
+	sessionCredStore := sessioncred.NewStore(redisClient.Client, cfg.ExtensionSessionCredentialTTL)
+
 	jobQueue := worker.NewQueue(redisClient.Client, cfg.WorkerQueueSize)
 	jobStore := worker.NewStore(redisClient.Client, cfg.JobTTL)
 	pool := worker.NewPool(jobQueue, jobStore, safeFetcher, detectorClient, logger)
@@ -223,8 +235,6 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1.POST("/analyze-audio", handlers.NewAnalyzeAudio(audioClient))
 	v1.POST("/analyze-session", handlers.NewAnalyzeSession(sessionService, riskEngine))
 	v1.GET("/ws", handlers.NewWebSocket(signalingHub, logger))
-	v1.POST("/sessions", handlers.NewCreateSession(liveSessionStore, sessionRepo))
-	v1.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 	v1.GET("/sessions/metrics", auth.RequireRole(auth.RoleAdmin), handlers.NewSessionMetrics(liveSessionStore))
 	v1.GET("/sessions/:id/analysis", handlers.NewGetAnalysisResult(analysisRepo))
 	// POST /analysis gets a stricter rate limit layered on top of the
@@ -238,6 +248,36 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 		handlers.NewCreateAnalysisJob(videoQueue, audioQueue, jobsRepo, urlValidator, logger),
 	)
 	v1.GET("/analysis/jobs/:id", handlers.NewGetAnalysisJob(jobsRepo))
+
+	// Phase 8.1: the Chrome extension's own, separate auth flow. A
+	// distinct route group sharing /api/v1's prefix (gin treats each
+	// Group() call independently — this one never runs v1's blanket
+	// auth.Middleware above, and v1 never runs ExtensionMiddleware here)
+	// rather than a route added onto v1 — that group's Middleware only
+	// knows AuthToken/AdminAuthToken, and extending its tokens map with
+	// ExtensionAuthToken would silently authorize the extension token for
+	// every other route in v1 too, defeating the whole point of a
+	// minimum-privilege, single-purpose credential.
+	v1Auth := router.Group("/api/v1")
+	v1Auth.Use(auth.ExtensionMiddleware(cfg.ExtensionAuthToken))
+	v1Auth.Use(ratelimit.Middleware(limiter, "auth-session", authSessionRateLimit, logger))
+	v1Auth.POST("/auth/session", handlers.NewAuthSession(sessionCredStore))
+
+	// Also its own group: POST /sessions and GET /sessions/ws are the
+	// only two routes a session credential from POST /api/v1/auth/session
+	// is ever valid for (see sessionAuth) — everywhere else in the API,
+	// including /sessions/metrics and /sessions/:id/analysis above, still
+	// requires a real AuthToken/AdminAuthToken exactly as before.
+	// sessionAuth also still accepts those same long-lived tokens, so
+	// every existing caller of these two routes keeps working unchanged.
+	v1Sessions := router.Group("/api/v1")
+	v1Sessions.Use(sessionAuth(map[string]auth.Role{
+		cfg.AuthToken:      auth.RoleUser,
+		cfg.AdminAuthToken: auth.RoleAdmin,
+	}, sessionCredStore))
+	v1Sessions.Use(ratelimit.Middleware(limiter, "default", defaultRateLimit, logger))
+	v1Sessions.POST("/sessions", handlers.NewCreateSession(liveSessionStore, sessionRepo))
+	v1Sessions.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
 
 	return &Server{
 		HTTP: &http.Server{

@@ -14,6 +14,9 @@ func TestLoad_Defaults(t *testing.T) {
 	// (see TestLoad_MissingAuthToken/TestLoad_MissingAdminAuthToken).
 	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
 	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "test-admin-token")
+	// GATEWAY_EXTENSION_TOKEN has no default either (see
+	// TestLoad_MissingExtensionToken).
+	t.Setenv("GATEWAY_EXTENSION_TOKEN", "test-extension-token")
 
 	cfg, err := Load()
 	if err != nil {
@@ -95,6 +98,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.AdminAuthToken != "test-admin-token" {
 		t.Errorf("AdminAuthToken = %q, want the value GATEWAY_ADMIN_AUTH_TOKEN was set to", cfg.AdminAuthToken)
 	}
+	if cfg.ExtensionAuthToken != "test-extension-token" {
+		t.Errorf("ExtensionAuthToken = %q, want the value GATEWAY_EXTENSION_TOKEN was set to", cfg.ExtensionAuthToken)
+	}
+	if cfg.ExtensionSessionCredentialTTL != defaultExtensionSessionCredentialTTL {
+		t.Errorf("ExtensionSessionCredentialTTL = %v, want %v", cfg.ExtensionSessionCredentialTTL, defaultExtensionSessionCredentialTTL)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -123,6 +132,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	t.Setenv("GATEWAY_AUDIO_WORKERS", "4")
 	t.Setenv("GATEWAY_AUTH_TOKEN", "override-token")
 	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "override-admin-token")
+	t.Setenv("GATEWAY_EXTENSION_TOKEN", "override-extension-token")
+	t.Setenv("GATEWAY_EXTENSION_SESSION_TTL", "5m")
 
 	cfg, err := Load()
 	if err != nil {
@@ -203,6 +214,12 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	}
 	if cfg.AdminAuthToken != "override-admin-token" {
 		t.Errorf("AdminAuthToken = %q, want %q", cfg.AdminAuthToken, "override-admin-token")
+	}
+	if cfg.ExtensionAuthToken != "override-extension-token" {
+		t.Errorf("ExtensionAuthToken = %q, want %q", cfg.ExtensionAuthToken, "override-extension-token")
+	}
+	if cfg.ExtensionSessionCredentialTTL != 5*time.Minute {
+		t.Errorf("ExtensionSessionCredentialTTL = %v, want %v", cfg.ExtensionSessionCredentialTTL, 5*time.Minute)
 	}
 }
 
@@ -377,6 +394,37 @@ func TestLoad_MissingAdminAuthToken(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() with GATEWAY_ADMIN_AUTH_TOKEN unset: expected error, got nil")
+	}
+}
+
+// TestLoad_MissingExtensionToken mirrors TestLoad_MissingAdminAuthToken
+// for GATEWAY_EXTENSION_TOKEN — also a credential with no default
+// (8.1). GATEWAY_AUTH_TOKEN/GATEWAY_ADMIN_AUTH_TOKEN are set here so the
+// error is actually about the missing extension token, not either of
+// those.
+func TestLoad_MissingExtensionToken(t *testing.T) {
+	t.Setenv("GATEWAY_DATABASE_URL", "postgres://user:pass@localhost:5432/mithyax")
+	t.Setenv("GATEWAY_AUTH_TOKEN", "test-token")
+	t.Setenv("GATEWAY_ADMIN_AUTH_TOKEN", "test-admin-token")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_EXTENSION_TOKEN unset: expected error, got nil")
+	}
+}
+
+func TestLoad_InvalidExtensionSessionTTL(t *testing.T) {
+	t.Setenv("GATEWAY_EXTENSION_SESSION_TTL", "not-a-duration")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with invalid GATEWAY_EXTENSION_SESSION_TTL: expected error, got nil")
+	}
+}
+
+func TestLoad_ZeroExtensionSessionTTL_Rejected(t *testing.T) {
+	t.Setenv("GATEWAY_EXTENSION_SESSION_TTL", "0s")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with GATEWAY_EXTENSION_SESSION_TTL=0s: expected error, got nil")
 	}
 }
 
