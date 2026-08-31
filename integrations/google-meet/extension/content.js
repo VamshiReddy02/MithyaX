@@ -71,6 +71,13 @@
   let positionTimer = null;
   let killed = false;
 
+  // Phase 8.10: edge-triggered state for the two console.debug calls in
+  // tick()/refreshAudioPairing() below that would otherwise fire once
+  // per DETECT_INTERVAL_MS for as long as a condition persists, instead
+  // of just once when it starts.
+  let atCapLastTick = false;
+  let audioAmbiguousLastTick = false;
+
   // Phase 8.6: Meet is a SPA — leaving a call and joining another can
   // happen entirely via client-side routing, with no page reload and so
   // no fresh content.js injection to reset any of this file's state.
@@ -206,10 +213,10 @@
         // ever surfaced them: the badge stayed frozen wherever it last
         // was (e.g. "Analyzing" forever) with no visible sign anything
         // had gone wrong. A real cause is a plain fetch/WebSocket
-        // failure — a gateway that isn't reachable, an unedited
-        // GATEWAY_EXTENSION_TOKEN placeholder, credential exchange
-        // failing — logged here (and by background.js itself, see its
-        // own console.error) so the failure is at least visible in one
+        // failure — a gateway that isn't reachable, a rejected extension
+        // token, credential exchange failing — logged here (and by
+        // background.js itself, see its own console.error) so the
+        // failure is at least visible in one
         // of the two consoles. The raw message is developer-facing
         // (console only, Phase 8.8) — the badge shows the same
         // human "Analysis unavailable" state a person would need
@@ -245,6 +252,18 @@
         // disappearing and reappearing as a brand-new tile.
         case "reconnecting":
           updateBadge(key, { kind: "reconnecting", attempt: message.attempt });
+          break;
+        // Phase 8.10: setup was never finished (fresh install, or the
+        // options page's fields were cleared) — not a connection
+        // failure, so it gets its own badge kind rather than the
+        // "error" path's "Analysis unavailable" + retry-then-teardown
+        // behavior. Nothing to retry here: background.js already
+        // checked chrome.storage.local and found nothing, so this
+        // participant stays on this badge until a person actually opens
+        // the options page — tick()'s own detection loop keeps running
+        // regardless, so it recovers on its own once that happens.
+        case "not_configured":
+          updateBadge(key, { kind: "not_configured" });
           break;
       }
     });
@@ -392,10 +411,17 @@
     const unclaimed = [...findRemoteAudioStreams()].filter((s) => !claimed.has(s));
     if (needsAudio.length === 1 && unclaimed.length === 1) {
       pending.set(needsAudio[0][0], unclaimed[0]);
+      audioAmbiguousLastTick = false;
     } else if (needsAudio.length > 1 && unclaimed.length > 1) {
-      console.debug(
-        `MithyaX: ${needsAudio.length} participants and ${unclaimed.length} unattributed remote audio streams — pairing is ambiguous, leaving them without audio rather than guessing.`,
-      );
+      // Edge-triggered — see atCapLastTick's doc above for why.
+      if (!audioAmbiguousLastTick) {
+        console.debug(
+          `MithyaX: ${needsAudio.length} participants and ${unclaimed.length} unattributed remote audio streams — pairing is ambiguous, leaving them without audio rather than guessing.`,
+        );
+      }
+      audioAmbiguousLastTick = true;
+    } else {
+      audioAmbiguousLastTick = false;
     }
 
     for (const [key, stream] of pending) {
@@ -498,15 +524,21 @@
     }
 
     if (participants.size < MAX_CONCURRENT_PARTICIPANTS) {
+      atCapLastTick = false;
       for (const [key, el] of found) {
         if (participants.size >= MAX_CONCURRENT_PARTICIPANTS) break;
         if (!participants.has(key)) startParticipant(key, el);
       }
     } else {
       const newTileCount = [...found.keys()].filter((key) => !participants.has(key)).length;
-      if (newTileCount > 0) {
+      // Phase 8.10: edge-triggered (only on the transition into this
+      // state), not once per tick — a large call sitting at the cap
+      // with tiles rotating in and out would otherwise log every
+      // DETECT_INTERVAL_MS for as long as that lasts.
+      if (newTileCount > 0 && !atCapLastTick) {
         console.debug(`MithyaX: at the ${MAX_CONCURRENT_PARTICIPANTS}-participant cap, not starting ${newTileCount} newly-detected tile(s).`);
       }
+      atCapLastTick = newTileCount > 0;
     }
 
     refreshAudioPairing();

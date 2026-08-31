@@ -4,33 +4,41 @@
 // capture data in from content.js, labeled risk state back out to it.
 //
 // This is also the whole of the extension's security boundary (Phase
-// 8.1/8.2): GATEWAY_EXTENSION_TOKEN below is read only in this file,
-// never forwarded to content.js/detector.js/ui.js or any code that runs
-// in the Meet page itself — those only ever exchange plain "start"/
-// "frame"/"audio_chunk"/"stop"/"state" messages over a runtime.connect
-// port, none of which carries a credential of any kind. This file
-// exchanges that token for a short-lived session credential
+// 8.1/8.2): the extension token read via getConfig() below is read only
+// in this file, never forwarded to content.js/detector.js/ui.js or any
+// code that runs in the Meet page itself — those only ever exchange
+// plain "start"/"frame"/"audio_chunk"/"stop"/"state" messages over a
+// runtime.connect port, none of which carries a credential of any kind.
+// This file exchanges that token for a short-lived session credential
 // (getSessionCredential) and is the only thing that ever uses either
 // one — see websocket.js for how the credential then flows into
 // POST /api/v1/sessions and the sessions/ws WebSocket.
 //
-// Edit GATEWAY_HTTP_URL if the gateway isn't on localhost:8080 — there's
-// no settings UI yet (see README in this directory).
+// Phase 8.10: gateway URL + token used to be hardcoded constants edited
+// by hand; a real pilot tester can't do that, so both now live in
+// chrome.storage.local, set via options.html/options.js (opened from
+// the toolbar icon — see the chrome.action listener below) and read
+// fresh by getConfig() on every "start". Not cached at module scope:
+// this service worker can be recycled by Chrome at any time anyway, and
+// a value the user just changed in the options page should take effect
+// on the very next connection attempt, not after a restart.
 import { MithyaXSession, SessionCreateError } from "./websocket.js";
 import { createDetectorState, applyMessage } from "./detector.js";
 
-const GATEWAY_HTTP_URL = "http://localhost:8080";
+// getConfig returns null if setup hasn't happened yet (fresh install,
+// options page never opened/saved) — every caller below treats that as
+// a distinct, expected state, not an error.
+async function getConfig() {
+  const { gatewayUrl, extensionToken } = await chrome.storage.local.get(["gatewayUrl", "extensionToken"]);
+  if (!gatewayUrl || !extensionToken) return null;
+  return { gatewayUrl, extensionToken };
+}
 
-// GATEWAY_EXTENSION_TOKEN is the extension's own, narrowly-scoped
-// credential — it authorizes exactly one call, POST /api/v1/auth/session
-// below, and nothing else in the gateway's API (see internal/auth.
-// ExtensionMiddleware on the gateway side). Replace this placeholder with
-// the same value the gateway is configured with
-// (GATEWAY_EXTENSION_TOKEN in deployments/docker/.env) — no settings UI
-// yet, same as GATEWAY_HTTP_URL above. This must never be
-// GATEWAY_AUTH_TOKEN or GATEWAY_ADMIN_AUTH_TOKEN — the whole point of
-// this token is that it can do nothing else if it ever leaked.
-const GATEWAY_EXTENSION_TOKEN = "REPLACE_WITH_YOUR_GATEWAY_EXTENSION_TOKEN";
+// A first-run affordance: this extension has no popup, so clicking the
+// toolbar icon goes straight to the one place setup actually happens.
+chrome.action.onClicked.addListener(() => {
+  chrome.runtime.openOptionsPage();
+});
 
 // How much earlier than its real expiry a cached session credential is
 // treated as already expired — guards against starting a session with
@@ -65,21 +73,21 @@ function reconnectDelayMs(attempt) {
 // which already forces a fresh one to be minted on the next use.
 let cachedCredential = null; // { token, expiresAt }
 
-// getSessionCredential returns a currently-valid session credential,
-// exchanging GATEWAY_EXTENSION_TOKEN for a new one via
+// getSessionCredential returns a currently-valid session credential for
+// the given config, exchanging its extensionToken for a new one via
 // POST /api/v1/auth/session if none is cached or the cached one is at
 // (or near) expiry. forceRefresh skips the cache entirely — used after
 // the gateway itself has rejected a credential (see connectSession's
 // 401 retry), which is a stronger signal than this function's own clock
 // that it's no longer good.
-async function getSessionCredential(forceRefresh = false) {
+async function getSessionCredential(config, forceRefresh = false) {
   if (!forceRefresh && cachedCredential && cachedCredential.expiresAt - CREDENTIAL_EXPIRY_SAFETY_MARGIN_MS > Date.now()) {
     return cachedCredential.token;
   }
 
-  const resp = await fetch(`${GATEWAY_HTTP_URL}/api/v1/auth/session`, {
+  const resp = await fetch(`${config.gatewayUrl}/api/v1/auth/session`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${GATEWAY_EXTENSION_TOKEN}` },
+    headers: { Authorization: `Bearer ${config.extensionToken}` },
   });
   if (!resp.ok) {
     cachedCredential = null;
@@ -97,14 +105,14 @@ async function getSessionCredential(forceRefresh = false) {
 // covers the credential expiring, or otherwise no longer being valid,
 // between getSessionCredential's own clock-based check and the gateway
 // actually seeing the request.
-async function connectSession(callbacks) {
-  const session = new MithyaXSession(GATEWAY_HTTP_URL, callbacks);
-  let credential = await getSessionCredential();
+async function connectSession(config, callbacks) {
+  const session = new MithyaXSession(config.gatewayUrl, callbacks);
+  let credential = await getSessionCredential(config);
   try {
     await session.connect(credential);
   } catch (err) {
     if (!(err instanceof SessionCreateError) || err.status !== 401) throw err;
-    credential = await getSessionCredential(true);
+    credential = await getSessionCredential(config, true);
     await session.connect(credential);
   }
   return session;
@@ -187,8 +195,22 @@ chrome.runtime.onConnect.addListener((port) => {
     reconnectTimer = null;
     state = createDetectorState();
     const myGeneration = generation;
+
+    const config = await getConfig();
+    if (myGeneration !== generation) return; // superseded while awaiting storage
+    if (!config) {
+      // Fresh install, or the user cleared the fields — this isn't a
+      // connection failure worth retrying (see scheduleReconnect's own
+      // backoff/give-up logic below), it's "setup was never finished."
+      // content.js maps this straight to a distinct badge kind rather
+      // than the generic "Analysis unavailable" a real connection
+      // failure gets (see content.js/ui.js Phase 8.10 changes).
+      safePost({ type: "not_configured" });
+      return;
+    }
+
     try {
-      const newSession = await connectSession({
+      const newSession = await connectSession(config, {
         onMessage: (msg) => {
           if (myGeneration !== generation) return; // superseded — see `generation`'s doc above
           state = applyMessage(state, msg);

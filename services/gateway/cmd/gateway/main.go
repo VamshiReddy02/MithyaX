@@ -17,10 +17,36 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	if err := run(); err != nil {
 		slog.Error("gateway exited with error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+}
+
+// healthcheck backs the container's own HEALTHCHECK (see
+// deployments/docker/docker-compose.yml): the gateway ships in
+// gcr.io/distroless/static-debian12, which has no shell, wget, or curl
+// for a normal exec-based check to run, so the binary checks itself by
+// hitting its own GET /health over loopback and mapping the response to
+// a process exit code.
+func healthcheck() int {
+	cfg, err := config.Load()
+	if err != nil {
+		return 1
+	}
+	resp, err := http.Get("http://localhost:" + cfg.Port + "/health")
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }
 
 func run() error {

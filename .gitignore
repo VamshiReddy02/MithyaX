@@ -30,3 +30,4 @@ build/
 # Generated
 *.pb.go
 *_grpc.pb.go
+integrations/google-meet/extension/mithyax-extension.zip

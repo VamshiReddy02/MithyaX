@@ -36,12 +36,14 @@
     reconnecting: "🔄",
     unavailable: "⚠️",
     left: "👋",
+    not_configured: "⚙️",
   };
   const KIND_LABEL = {
     connecting: "Connecting…",
     analyzing: "Analyzing…",
     unavailable: "Analysis unavailable",
     left: "Participant left",
+    not_configured: "Setup needed — click the MithyaX icon",
   };
 
   // One entry per participant key. Was a handful of module-level
@@ -143,7 +145,11 @@
     } else {
       b.dotEl.textContent = KIND_EMOJI[kind] || KIND_EMOJI.analyzing;
       b.verdictEl.textContent = kind === "reconnecting" ? `Reconnecting… (${state.attempt})` : KIND_LABEL[kind] || KIND_LABEL.analyzing;
-      b.badgeEl.dataset.tier = kind === "unavailable" ? "unavailable" : "unknown";
+      // "not_configured" reuses "unavailable"'s muted-amber styling —
+      // same "this isn't a risk verdict" visual language, no new
+      // styles.css rule needed for what's really the same category of
+      // state (can't currently analyze) with a different cause.
+      b.badgeEl.dataset.tier = kind === "unavailable" || kind === "not_configured" ? "unavailable" : "unknown";
 
       // Nothing to explain for a connection/lifecycle state — collapse
       // and hide the toggle rather than leaving a stale verdict's

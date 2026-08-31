@@ -1,6 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -11,6 +12,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       # Sourced from .env (see .env.example) — no fallback values here on
       # purpose, so no credential of any kind, dev or otherwise, sits in
@@ -32,6 +34,7 @@ services:
   video-detector:
     build:
       context: ../../services/video-detector
+    restart: unless-stopped
     ports:
       - "8000:8000"
     healthcheck:
@@ -44,9 +47,14 @@ services:
   gateway:
     build:
       context: ../../services/gateway
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
+      # Defaults to "development" (see internal/config.defaultEnvironment)
+      # if unset, which never engages gin's release mode — this is the
+      # one thing that made this a "production" deployment in name only.
+      GATEWAY_ENV: production
       GATEWAY_DETECTOR_URL: http://video-detector:8000
       # CPU-only inference inside the container (no MPS/GPU passthrough)
       # is much slower than a host run, so this needs real headroom.
@@ -63,6 +71,15 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    healthcheck:
+      # /gateway ships in a distroless image with no shell/wget/curl to
+      # exec a normal check with — see cmd/gateway/main.go's -healthcheck
+      # flag, which hits GET /health over loopback and exits accordingly.
+      test: ["CMD", "/gateway", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
 volumes:
   postgres-data:
