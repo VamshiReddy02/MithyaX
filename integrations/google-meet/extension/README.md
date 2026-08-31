@@ -24,7 +24,7 @@ WebSocket, and risk state (Phase 8.4).
 
 ## What "working" looks like
 
-- A badge reading "MithyaX ⚪ Analyzing…" appears over each remote
+- A badge reading "MithyaX ⚪ Connecting…" appears over each remote
   participant's tile within a couple seconds of their video appearing —
   one badge per participant, up to `MAX_CONCURRENT_PARTICIPANTS` (4 by
   default; see `content.js`).
@@ -32,10 +32,13 @@ WebSocket, and risk state (Phase 8.4).
   extension → "service worker") to see `session_started` / `video_result`
   / `audio_result` / `temporal_result` / `risk_update` messages arriving
   from the gateway — one independent stream of these per participant.
-- Each badge updates to 🟢 Real / 🟡 Suspicious / 🔴 AI / High risk with a
-  percentage, driven entirely by that participant's own `risk_update` —
-  the extension never scores anything itself, and one participant's
-  verdict never affects another's badge.
+- The badge moves to "⚪ Analyzing…" once a session is actually live, then
+  to a plain-language verdict — 🟢 Likely Authentic / 🟡 Suspicious / 🔴
+  Likely AI-Generated — driven entirely by that participant's own
+  `risk_update`. Clicking "Why?" on a verdict expands a short explanation
+  and confidence percentage; see "How the badge communicates" below for
+  the full state model and why raw model scores are never shown. One
+  participant's verdict never affects another's badge.
 
 ## How it's wired
 
@@ -135,6 +138,65 @@ audio-pairing strategy above, against DevTools on a live call with **2+
 simultaneous remote participants** before relying on this for anything
 beyond a proof of concept.
 
+## How the badge communicates (Phase 8.8)
+
+The goal isn't more detection infrastructure — it's making sure someone
+who has never seen MithyaX before can look at a badge and immediately
+answer: what is it doing, what does this result mean, should they be
+concerned, and is it currently working at all. Concretely, that meant
+never showing a raw model number and never letting a connection problem
+look like a risk verdict.
+
+- **State model** (`detector.js` produces `"analyzing"`/`"verdict"` from
+  the risk engine's own messages; `content.js` constructs the rest —
+  see each file's own doc): `Connecting…` (before a session exists yet)
+  → `Analyzing…` (session live, no confident verdict yet — this is also
+  where a `risk_update` with verdict `UNKNOWN`, i.e. no usable signal at
+  all, lands; it reads to a user exactly like "still gathering data",
+  not a fourth kind of result) → 🟢 **Likely Authentic** / 🟡
+  **Suspicious** / 🔴 **Likely AI-Generated**. Independently,
+  `Reconnecting… (attempt N)`, `Analysis unavailable`, and
+  `Participant left` cover the operational/connection states — these are
+  facts about the connection, not the risk engine, and are deliberately
+  styled distinctly (`⚠️`, its own `data-tier="unavailable"`, a muted
+  amber never confusable with the red "likely fake" styling) so a
+  connection problem can never be mistaken for an actual detection
+  result.
+- **Never a raw score.** `video_score: 0.731` never reaches the page.
+  `detector.js` derives a `confidence` percentage instead — not the same
+  number as the risk engine's raw [0,1] fake-likelihood score, but its
+  *meaning*: how confident a user should be in the verdict they're
+  looking at. A low fake-score is *why* something is called authentic,
+  so confidence rises as the score falls toward 0 for that verdict; a
+  high score is why something is called fake, so confidence rises as the
+  score climbs toward 1 there. `reasons` are already human sentences
+  from the gateway's own risk engine (e.g. "Video signal indicates
+  likely synthetic or manipulated content") — never bare numbers — and
+  the raw per-modality scores stay on the state object only for
+  developer console debugging; `ui.js` never renders them.
+- **Details are opt-in, not upfront.** The compact pill badge is always
+  what's visible; clicking "Why?" (only shown for an actual verdict —
+  there's nothing to explain about "Connecting…") expands a small panel
+  with the plain-language description, the confidence percentage, and
+  the reasons list. A hover tooltip mirrors the same text as a zero-click
+  fallback. `pointer-events: none` stays on the badge as a whole (so it
+  never blocks clicking through to Meet's own controls underneath) —
+  only the toggle button and the details panel it opens turn
+  `pointer-events: auto` back on for themselves.
+- A terminal, human-facing message (`Participant left`,
+  `Analysis unavailable`) stays visible for `PARTICIPANT_LEFT_DISPLAY_MS`
+  (2.5s, in `content.js`) before the badge is actually removed — without
+  that delay, `removeBadge` would erase the very text `updateBadge` just
+  set in the same synchronous step, and a person would never actually
+  see it. If the participant's video reappears during that window (a
+  brief blip, not a real departure), the pending removal is cancelled.
+- Verified directly against the real gateway (Phase 8.8's own
+  end-to-end check): a genuine `risk_update` correctly produced
+  `{headline: "Likely Authentic", description: "...", confidence: 67}`
+  from a real temporal score of 0.333 — confirming the confidence
+  derivation is correct against real data, not just synthetic test
+  inputs.
+
 ## How it authenticates
 
 The extension never carries the gateway's long-lived `GATEWAY_AUTH_TOKEN`
@@ -220,24 +282,164 @@ rebuild everything from scratch (Phase 8.5):
   time, so a successful reconnect just resumes rather than making the
   participant disappear and reappear as a new tile.
 
-## Known limitations (by design, for this first pass)
+## How it handles Meet's own navigation (Phase 8.6)
 
+Meet is a single-page app: leaving one call and joining another can
+happen entirely through client-side routing, with no page reload — so
+no fresh `content.js` injection ever comes along to reset this file's
+state the way a real navigation would.
+
+- **A fast, explicit "the meeting changed" signal, on top of the
+  existing passive one.** Meet's meeting code lives in the URL path
+  (its well-known public link format, `meet.google.com/xxx-yyyy-zzz`),
+  so `tick()` compares just `location.pathname` (deliberately not the
+  full URL — Meet may change query string/hash for in-call UI state
+  that isn't a different meeting, which must not cause a false-positive
+  teardown of participants who never left) against what it last saw.
+  When it changes, every currently-tracked participant is torn down
+  immediately — badge removed, port stopped — rather than waiting on
+  the several-second passive "video element disappeared" detection
+  (which still exists and still works as a fallback; this is a faster,
+  more specific complement to it, not a replacement).
+- **A real race this surfaced, fixed in `background.js`.** Because
+  `connectWithSession` is async, a "stop" (from the transition above, or
+  from a participant's ordinary grace-period timeout) can arrive while a
+  connect or reconnect attempt for that same participant is already in
+  flight — at that exact moment there's no live `session` object yet
+  for "stop" to end. Without a fix, that in-flight attempt would later
+  resolve, quietly assign itself as the live session, and keep running:
+  an orphaned WebSocket and a gateway session nobody asked for, for a
+  meeting that's already gone. `background.js` now tags every
+  connect/reconnect attempt with a generation number that any stop,
+  disconnect, or fresh start bumps; an attempt that resolves after being
+  superseded is discarded and immediately ended rather than ever being
+  assigned live. Verified directly against the real gateway with an
+  artificially delayed connect to force the exact race: the socket does
+  open, and is then closed again within the same tick — content.js
+  never sees so much as a `state` message for it.
+
+## Multi-participant stress verification (Phase 8.7)
+
+Rather than testing `content.js` and `background.js` separately (as
+8.4-8.6 did), this phase wired the real, unmodified files together
+through a genuine two-way port pair — the same integration Chrome
+itself provides — against the real running gateway, and drove one long
+scenario with four concurrent participants (A, B, C, D): all four
+joining up to the concurrency cap, A leaving, B's tile element being
+replaced, C briefly disappearing and returning, A rejoining as a
+genuinely new participant, D and B's WebSockets being force-closed
+*simultaneously* to stress independent concurrent reconnects, tile
+reordering, and three rapid full join/leave/rejoin cycles for a fifth
+participant. 32 checks passed: stable identity across reordering, no
+cross-talk between any two participants' sessions or audio, exactly one
+session per join with no orphans across rapid cycling, isolated
+concurrent reconnects, and zero leaked sockets at the end. No new bugs
+turned up this time — the 8.4/8.5/8.6 fixes already covered this.
+
+## Security/reliability hardening pass (Phase 8.9)
+
+A small, focused audit against a specific checklist (extension token
+handling, credential leakage, console log content, message validation,
+timer/port/WebSocket cleanup, duplicate sessions) rather than another
+architectural phase. Two real, concrete findings — not padding:
+
+- **Console logging could leak the session credential.**
+  `websocket.js`'s WebSocket `onerror` handler used to forward the raw
+  native `Event` straight to `background.js`'s `console.error(...)`. A
+  WebSocket `Event`'s `.target` is the socket itself, and
+  `this.ws.url` is the `sessions/ws` URL — which carries the session
+  credential as a query parameter (see "How it authenticates"). Nothing
+  printed it directly, but a developer expanding that logged object in
+  DevTools could have read the credential straight off
+  `event.target.url`. Now `onerror` only ever constructs and forwards a
+  plain `Error("session websocket error")` — a WebSocket error event
+  carries no diagnostic payload of its own by browser design, so nothing
+  informative was lost. Verified directly: fired a fake native-shaped
+  error event whose `.target` exposed a real credential-bearing URL, and
+  confirmed neither the object `onError` receives nor its stringified
+  form contain the credential.
+- **Two of `content.js`'s three top-level timers were never actually
+  stoppable.** `tickTimer` and `frameTimer`'s `setInterval` return
+  values were discarded at the call site — only `positionTimer` was
+  captured. `handleFatal` (extension context invalidated — e.g. the
+  extension was reloaded/updated while a tab was still open) correctly
+  stopped polling logically (`killed` short-circuits both `tick()` and
+  `sampleFrame()`), but the underlying intervals themselves kept firing,
+  harmlessly no-opping, for the rest of that tab's lifetime instead of
+  actually being cleared. Fixed by capturing and clearing all three.
+  Verified: after `handleFatal()` fires, advancing far past when either
+  timer would have fired again confirms neither does.
+- Also added minimal shape validation on both ends of the
+  `content.js` ↔ `background.js` port (`message` must be an object with
+  a string `type`; `frame`/`audio_chunk` payloads must be strings) —
+  this isn't a defense against a hostile sender (a Meet page script has
+  no way to get a reference to this port at all; content scripts run in
+  an isolated JavaScript world Chrome enforces, which is also the
+  underlying reason `window.__mithyax` in `capture.js`/`ui.js` is never
+  reachable from the Meet page's own `<script>` tags) — it's robustness
+  against a malformed message reaching a `switch` and throwing out of an
+  event listener. Verified with a battery of malformed inputs (`null`,
+  wrong types, unexpected shapes) against both listeners directly.
+- Everything else on the checklist — port disconnect cleanup, WebSocket
+  cleanup, duplicate-session prevention, gateway-unavailable and
+  extension-reload behavior, multi-participant rapid lifecycle events —
+  was already covered by 8.4-8.7's work and re-confirmed rather than
+  changed; see those phases' own sections above for what was actually
+  built and how it was verified.
+- **Critical security check, confirmed by direct inspection**:
+  `GATEWAY_EXTENSION_TOKEN` and the short-lived session credential it's
+  exchanged for appear nowhere outside `background.js`/`websocket.js` —
+  grepped across every file. `content.js`'s only mention of either term
+  is a code comment.
+
+## ⚠️ Outstanding validation items for the real Meet test
+
+These are not bugs, and not things to "fix" based on assumption — they
+are heuristics/strategies whose correctness depends on Meet's actual
+DOM, which nothing in this codebase can observe without a real call.
+Simulating a plausible DOM shape and getting a passing test (as 8.3, 8.4,
+and 8.7 all did) is evidence the *logic* is sound given that shape — it
+is not evidence the shape itself is what Meet actually produces. Treat
+both items below as open until a real multi-participant Meet call
+confirms or refutes them; do not silently reinterpret "passed in
+simulation" as "verified."
+
+- **Audio-to-participant pairing under genuinely decoupled audio/video
+  streams is unverified.** `refreshAudioPairing` (`content.js`) has a
+  confident primary strategy for the common case — one combined
+  MediaStream carrying both a participant's video and audio track,
+  checked first, unambiguous regardless of participant count — and every
+  simulation so far (8.4's and 8.7's stress test alike) has exercised
+  exactly that case, because that's the only shape a simulated DOM can
+  assert without guessing at Meet's real internals. The fallback for a
+  *decoupled* `<audio>` element only fires when there's exactly one
+  participant needing audio and exactly one unclaimed stream — with two
+  or more of either, it deliberately leaves them without audio rather
+  than guessing (see "How it detects remote participants" above). Nobody
+  has yet confirmed whether real Meet ever produces the decoupled shape
+  at all with 2+ simultaneous remote participants, or how it's
+  structured in the DOM if it does. **Required test**: a real call with
+  2+ people talking, confirming each participant's `audio_result`
+  reacts to *their own* voice — not the assumption that the current
+  code is already correct.
 - Remote-element detection is a heuristic against an undocumented,
   frequently-changing DOM — expect to revisit it if Meet changes markup
   (see "How it detects remote participants" above).
-- **Audio-to-participant pairing has only been verified in simulation,
-  not against a real Meet call with multiple simultaneous remote
-  participants** — this is the one part of Phase 8.4 that needs live
-  confirmation before being relied on beyond a proof of concept. If real
-  Meet DOM turns out to decouple audio/video per tile even with several
-  participants present, the "exactly one unclaimed audio stream" fallback
-  in `refreshAudioPairing` won't be able to attribute audio for more than
-  one of them at a time (it won't guess wrong — it'll just leave those
-  participants without audio) until a real DOM-proximity strategy is
-  built from what an actual call's structure shows.
+
+## Known limitations (by design, for this first pass)
+
 - Capped at `MAX_CONCURRENT_PARTICIPANTS` (4) simultaneous participants
   per tab — a deliberate limit on this tab's own resource usage, not
   the gateway's.
+- **The meeting-transition detection (Phase 8.6) trusts `location.pathname`
+  as Meet's meeting-code boundary** — reasonable given it's Meet's own
+  public link format, but not re-verified against every in-call URL
+  mutation Meet might make (e.g. some in-call overlay changing the path
+  itself rather than just query/hash, which isn't expected but hasn't
+  been ruled out live). If that ever turns out to happen, the practical
+  effect would be an unnecessary participant teardown/restart, not a
+  correctness or leak issue — the passive detection and the reconnect
+  generation guard are independent safety nets underneath it either way.
 - No settings UI yet — gateway URL, extension token, and the
   concurrency cap are all constants in `background.js`/`content.js`.
 - MV3 service workers can be recycled by Chrome; when that happens

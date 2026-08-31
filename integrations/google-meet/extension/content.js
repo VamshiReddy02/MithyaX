@@ -42,6 +42,12 @@
   // Already-tracked participants are never evicted to make room for a
   // new one — the cap only gates whether a brand-new tile gets a slot.
   const MAX_CONCURRENT_PARTICIPANTS = 4;
+  // Phase 8.8: how long a terminal, human-facing badge message
+  // ("Participant left", "Analysis unavailable") stays visible before
+  // the badge is actually removed. Without this, updateBadge's text was
+  // immediately overwritten by the very next removeBadge call in the
+  // same synchronous step — a person would never actually see it.
+  const PARTICIPANT_LEFT_DISPLAY_MS = 2500;
 
   const { captureFrameBase64, RemoteAudioCapture } = window.__mithyax.capture;
   const { updateBadge, removeBadge, positionBadge } = window.__mithyax.ui;
@@ -52,8 +58,34 @@
   // single-participant version of this file used to have.
   const participants = new Map();
 
+  // Phase 8.9: all three of this file's top-level (i.e. not
+  // per-participant) intervals are tracked here so handleFatal can
+  // actually stop every one of them — tickTimer and frameTimer used to
+  // be started via bare setInterval() calls with their ids discarded,
+  // so once killed became true they kept firing (harmlessly no-opping
+  // each time, since tick()/sampleFrame() both check killed or find no
+  // participants left) for the rest of the tab's lifetime instead of
+  // actually stopping. positionTimer was already the one exception.
+  let tickTimer = null;
+  let frameTimer = null;
   let positionTimer = null;
   let killed = false;
+
+  // Phase 8.6: Meet is a SPA — leaving a call and joining another can
+  // happen entirely via client-side routing, with no page reload and so
+  // no fresh content.js injection to reset any of this file's state.
+  // The passive "video element disappeared" detection already tears
+  // down a departed participant within PARTICIPANT_LEFT_GRACE_TICKS
+  // (~6s) regardless, but that's a fallback for "something changed,
+  // not sure what" — a meeting transition is a stronger, more specific
+  // signal this file can act on immediately instead of waiting for it.
+  // Meet's meeting code lives in the URL path (meet.google.com/xxx-yyyy-zzz,
+  // its well-known public link format), so comparing just the path
+  // — not the full href — deliberately ignores query string/hash
+  // changes Meet might make for in-call UI state that isn't actually a
+  // different meeting, which would otherwise cause false-positive
+  // teardowns of participants who never left.
+  let lastMeetingPath = location.pathname;
 
   // Stops everything permanently for the rest of this tab's lifetime —
   // for anything with no recovery short of the user reloading the tab.
@@ -66,6 +98,10 @@
     killed = true;
     console.warn("MithyaX: stopping — reload this tab to reconnect.", err);
     for (const key of [...participants.keys()]) stopParticipant(key);
+    clearInterval(tickTimer);
+    tickTimer = null;
+    clearInterval(frameTimer);
+    frameTimer = null;
     clearInterval(positionTimer);
     positionTimer = null;
   }
@@ -155,9 +191,15 @@
       return null;
     }
     port.onMessage.addListener((message) => {
+      // Phase 8.9: background.js is the only sender on this port — this
+      // guards against a malformed message (a bug, not a hostile
+      // sender) rather than a real trust boundary; see background.js's
+      // own identical guard for the fuller reasoning.
+      if (!message || typeof message.type !== "string") return;
+
       switch (message.type) {
         case "state":
-          updateBadge(key, message.state);
+          if (message.state && typeof message.state === "object") updateBadge(key, message.state);
           break;
         // "error"/"closed" used to be silently dropped here — background.js
         // still forwards them (see its own safePost calls), but nothing
@@ -168,20 +210,29 @@
         // GATEWAY_EXTENSION_TOKEN placeholder, credential exchange
         // failing — logged here (and by background.js itself, see its
         // own console.error) so the failure is at least visible in one
-        // of the two consoles. Reaching "error" now means background.js
-        // (Phase 8.5) already tried reconnecting with backoff and gave
-        // up for good — so this still tears this one participant down
-        // (not stuck showing "Error" forever while everyone else keeps
+        // of the two consoles. The raw message is developer-facing
+        // (console only, Phase 8.8) — the badge shows the same
+        // human "Analysis unavailable" state a person would need
+        // regardless of the underlying cause. Reaching "error" means
+        // background.js (Phase 8.5) already tried reconnecting with
+        // backoff and gave up for good — so this still tears this one
+        // participant down (not stuck forever while everyone else keeps
         // working) so the next tick's fresh detection can retry it from
-        // scratch.
+        // scratch — just not instantly, so "Analysis unavailable" is
+        // actually visible for a moment first (see PARTICIPANT_LEFT_DISPLAY_MS's doc).
         case "error":
           console.error(`MithyaX[${key}]: session error —`, message.message);
-          updateBadge(key, { tier: "unknown", label: "Error — see console" });
-          stopParticipant(key);
+          updateBadge(key, { kind: "unavailable" });
+          setTimeout(() => stopParticipant(key), PARTICIPANT_LEFT_DISPLAY_MS);
           break;
         case "closed":
+          // In practice this is always a redundant echo of a stop this
+          // same tab already initiated (see background.js's onClose —
+          // it only sends "closed" when intentionalStop/disconnected is
+          // already true, both of which content.js itself set) — the
+          // participant is normally already torn down by the time this
+          // arrives, so stopParticipant below is a harmless no-op.
           console.warn(`MithyaX[${key}]: gateway session closed.`);
-          updateBadge(key, { tier: "unknown", label: "Disconnected" });
           stopParticipant(key);
           break;
         // Phase 8.5: an unexpected drop that background.js is actively
@@ -193,7 +244,7 @@
         // where the badge left off instead of this participant
         // disappearing and reappearing as a brand-new tile.
         case "reconnecting":
-          updateBadge(key, { tier: "unknown", label: `Reconnecting… (${message.attempt})` });
+          updateBadge(key, { kind: "reconnecting", attempt: message.attempt });
           break;
       }
     });
@@ -257,6 +308,13 @@
       sampling: false,
       audioCapture: null,
       audioStreamRef: null,
+      // Set only while this participant is showing "Participant left"
+      // and waiting out PARTICIPANT_LEFT_DISPLAY_MS before actually
+      // being torn down (see tick()) — cancelled if their video
+      // reappears in the meantime, so a brief blip that recovers just
+      // before the grace period's display window ends doesn't still
+      // get stopped out from under a now-healthy participant.
+      leavingTimer: null,
     };
     participants.set(key, p);
 
@@ -266,7 +324,12 @@
       handleFatal(err);
       return;
     }
-    updateBadge(key, { tier: "unknown", label: "Analyzing" });
+    // "Connecting…", not "Analyzing" — this fires before the session
+    // has even been requested from the gateway; the first real "state"
+    // message (whatever detector.js's state is at that point — see its
+    // own doc) naturally advances the badge to "Analyzing…" once a
+    // session actually exists, and to a real verdict once one arrives.
+    updateBadge(key, { kind: "connecting" });
     positionBadge(key, videoEl);
   }
 
@@ -281,6 +344,7 @@
     if (!p) return;
     participants.delete(key);
 
+    if (p.leavingTimer) clearTimeout(p.leavingTimer);
     if (p.audioCapture) p.audioCapture.stop();
 
     if (p.port) {
@@ -376,14 +440,43 @@
   // subject to MAX_CONCURRENT_PARTICIPANTS).
   function tick() {
     if (killed) return;
+
+    if (location.pathname !== lastMeetingPath) {
+      // Meet navigated to a different meeting (or away from one) via
+      // in-page routing — no new content.js instance is coming to reset
+      // anything, so every currently-tracked participant belongs to a
+      // meeting that's no longer current. Tear all of them down right
+      // now rather than letting each one time out independently over
+      // the next several seconds: their badges shouldn't linger into
+      // whatever's on screen next, and background.js's own generation
+      // guard (Phase 8.6) makes sure a reconnect that happens to be
+      // in flight for one of them at this exact moment gets discarded
+      // instead of quietly resurrecting a session for a meeting that's
+      // already gone.
+      console.debug(`MithyaX: Meet navigated (${lastMeetingPath} -> ${location.pathname}) — clearing ${participants.size} tracked participant(s) from the previous meeting.`);
+      lastMeetingPath = location.pathname;
+      for (const key of [...participants.keys()]) stopParticipant(key);
+      // Fall through to the rest of this tick (below) so whatever's
+      // already on screen in the new meeting is picked up immediately,
+      // rather than waiting a full extra DETECT_INTERVAL_MS.
+    }
+
     const found = findRemoteVideoElements();
 
-    const toStop = [];
     for (const [key, p] of participants) {
       const el = found.get(key);
       if (el) {
         p.missedTicks = 0;
         p.currentVideoEl = el;
+        if (p.leavingTimer) {
+          // Reappeared just before the "Participant left" display
+          // window (below) actually removed them — cancel it. The next
+          // real state/risk_update message (already about to arrive,
+          // since frame sampling resumes immediately) naturally
+          // refreshes the badge off of "Participant left" on its own.
+          clearTimeout(p.leavingTimer);
+          p.leavingTimer = null;
+        }
         continue;
       }
       // Not found this tick — could be a genuine "left," or could be a
@@ -394,9 +487,15 @@
       // for PARTICIPANT_LEFT_GRACE_TICKS ticks in a row.
       p.currentVideoEl = null;
       p.missedTicks++;
-      if (p.missedTicks >= PARTICIPANT_LEFT_GRACE_TICKS) toStop.push(key);
+      if (p.missedTicks >= PARTICIPANT_LEFT_GRACE_TICKS && !p.leavingTimer) {
+        // Show it, then actually tear down after PARTICIPANT_LEFT_DISPLAY_MS
+        // — not immediately: removeBadge (inside stopParticipant) would
+        // otherwise erase this same badge text before a person ever had
+        // a chance to read it.
+        updateBadge(key, { kind: "left" });
+        p.leavingTimer = setTimeout(() => stopParticipant(key), PARTICIPANT_LEFT_DISPLAY_MS);
+      }
     }
-    for (const key of toStop) stopParticipant(key);
 
     if (participants.size < MAX_CONCURRENT_PARTICIPANTS) {
       for (const [key, el] of found) {
@@ -413,7 +512,7 @@
     refreshAudioPairing();
   }
 
-  setInterval(tick, DETECT_INTERVAL_MS);
+  tickTimer = setInterval(tick, DETECT_INTERVAL_MS);
   positionTimer = setInterval(() => {
     for (const p of participants.values()) positionBadge(p.key, p.currentVideoEl);
   }, POSITION_INTERVAL_MS);
@@ -424,7 +523,7 @@
   // participant's own `sampling` flag still prevents its own capture
   // calls from overlapping if that one participant's capture is slow;
   // it has no effect on any other participant's sampling.
-  setInterval(() => {
+  frameTimer = setInterval(() => {
     for (const p of participants.values()) sampleFrame(p);
   }, FRAME_SAMPLE_INTERVAL_MS);
 

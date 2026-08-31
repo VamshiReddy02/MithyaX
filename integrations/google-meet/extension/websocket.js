@@ -71,8 +71,17 @@ export class MithyaXSession {
     await new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.wsUrl(id, credential));
       this.ws.onopen = () => resolve();
-      this.ws.onerror = (event) => {
-        this.onError(event);
+      // Deliberately never forward the raw ErrorEvent to onError (Phase
+      // 8.9 finding): its .target is this.ws itself, and this.ws.url is
+      // the sessions/ws URL carrying the session credential as a query
+      // parameter (see wsUrl's own doc for why it has to be there). A
+      // WebSocket ErrorEvent carries no diagnostic payload of its own by
+      // browser design, so nothing informative is lost — but console.
+      // error(event) in the caller (background.js) would otherwise let
+      // anyone expanding that logged object in DevTools read the
+      // credential straight off event.target.url.
+      this.ws.onerror = () => {
+        this.onError(new Error("session websocket error"));
         reject(new Error("session websocket error"));
       };
       this.ws.onclose = () => this.onClose();

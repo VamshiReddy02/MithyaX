@@ -128,6 +128,23 @@ chrome.runtime.onConnect.addListener((port) => {
   let reconnectAttempts = 0;
   let reconnectTimer = null;
 
+  // generation guards against a real race (Phase 8.6, found while
+  // auditing Meet's SPA navigation behavior): connectWithSession is
+  // async, so a "stop" (or port disconnect) can arrive while a
+  // connect/reconnect attempt is already in flight. At that moment
+  // `session` is still null, so `session?.end()` in the "stop"/
+  // onDisconnect handlers below is a no-op — with nothing else, the
+  // in-flight attempt would later resolve, assign itself to `session`,
+  // and keep running: an orphaned WebSocket and a live gateway session
+  // nobody asked for anymore (e.g. Meet navigating away from a call
+  // right as a network-blip reconnect happens to be mid-flight). Every
+  // place that invalidates "whatever's currently connecting or
+  // connected" bumps this; connectWithSession captures it at the start
+  // and checks it again after every await, discarding (never assigning
+  // to `session`, immediately calling .end()) anything from a
+  // superseded generation.
+  let generation = 0;
+
   // The content script's tab can disappear (navigation, tab close, or
   // this very extension being reloaded mid-session) between us deciding
   // to post a message and the call landing, which throws "Attempting to
@@ -169,13 +186,16 @@ chrome.runtime.onConnect.addListener((port) => {
   async function connectWithSession() {
     reconnectTimer = null;
     state = createDetectorState();
+    const myGeneration = generation;
     try {
-      session = await connectSession({
+      const newSession = await connectSession({
         onMessage: (msg) => {
+          if (myGeneration !== generation) return; // superseded — see `generation`'s doc above
           state = applyMessage(state, msg);
           safePost({ type: "state", state, raw: msg });
         },
         onClose: () => {
+          if (myGeneration !== generation) return; // already discarded below; nothing left to do
           session = null;
           if (intentionalStop || disconnected) {
             safePost({ type: "closed" });
@@ -186,13 +206,29 @@ chrome.runtime.onConnect.addListener((port) => {
         // Diagnostic only — a WebSocket that errors always also closes,
         // so onClose above is the sole reconnect trigger; acting on
         // both would double-schedule a reconnect for one failure.
-        onError: (err) => console.error("MithyaX: session error —", err),
+        onError: (err) => {
+          if (myGeneration !== generation) return;
+          console.error("MithyaX: session error —", err);
+        },
       });
+
+      if (myGeneration !== generation) {
+        // A stop/disconnect (or a fresh start superseding this one)
+        // happened while connectSession was in flight. This session
+        // was never wanted — end it immediately rather than assigning
+        // it to `session` and leaving an orphaned WebSocket/gateway
+        // session running for a meeting that's already gone.
+        newSession.end();
+        return;
+      }
+
+      session = newSession;
       if (reconnectAttempts > 0) {
         console.warn(`MithyaX: reconnected after ${reconnectAttempts} attempt(s).`);
       }
       reconnectAttempts = 0;
     } catch (err) {
+      if (myGeneration !== generation) return; // superseded; don't schedule a reconnect nobody wants
       // Getting here means either the credential exchange itself failed
       // (bad/unset GATEWAY_EXTENSION_TOKEN, gateway unreachable) or
       // POST /api/v1/sessions failed for a reason other than an expired
@@ -211,24 +247,36 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   port.onMessage.addListener(async (message) => {
+    // Phase 8.9: content.js is the only sender on this port and its
+    // isolated-world isolation already keeps the Meet page itself from
+    // ever getting a reference to it (see the extension-wide security
+    // doc in this file's header) — this isn't a defense against a
+    // hostile sender, just against a malformed message (a bug, or a
+    // future message type reaching a build that doesn't handle it yet)
+    // reaching `message.type` on something that isn't shaped like a
+    // message at all and throwing out of this listener.
+    if (!message || typeof message.type !== "string") return;
+
     switch (message.type) {
       case "start":
         if (session || reconnectTimer) return; // already running or a reconnect is already scheduled
         intentionalStop = false;
         reconnectAttempts = 0;
+        generation++; // belt-and-suspenders: guarantees a fresh start never inherits a stale in-flight attempt
         await connectWithSession();
         break;
 
       case "frame":
-        session?.sendFrame(message.data);
+        if (typeof message.data === "string") session?.sendFrame(message.data);
         break;
 
       case "audio_chunk":
-        session?.sendAudioChunk(message.data);
+        if (typeof message.data === "string") session?.sendAudioChunk(message.data);
         break;
 
       case "stop":
         intentionalStop = true;
+        generation++;
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
         session?.end();
@@ -240,6 +288,7 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => {
     disconnected = true;
     intentionalStop = true;
+    generation++;
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
     session?.end();
