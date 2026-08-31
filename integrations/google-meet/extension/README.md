@@ -171,9 +171,54 @@ content.js  ──"start"──►  background.js  ──long-lived extension to
   `runtime.connect` port.
 - If the gateway rejects a cached credential outright (401) —
   it expired, or was otherwise invalidated — `background.js` mints a
-  fresh one and retries once. It doesn't yet reconnect a session whose
-  WebSocket drops mid-call for any other reason (see "Known
-  limitations" below).
+  fresh one and retries once. A session whose WebSocket drops for any
+  other reason is handled by the reconnect logic below, which reuses
+  this exact same credential machinery on every attempt.
+
+## How it recovers from disconnects
+
+A participant's WebSocket can drop for reasons that have nothing to do
+with them — a network blip, the gateway restarting — and `background.js`
+reconnects automatically rather than leaving `content.js` to notice and
+rebuild everything from scratch (Phase 8.5):
+
+- **Reconnect means a new session, not resumed history.** There's no
+  server-side concept of "resume session X" — the gateway finalizes and
+  deletes a session the moment its WebSocket closes, whatever the
+  reason (see `internal/handlers/sessionswebsocket.go`). So a reconnect
+  goes through the exact same `POST /api/v1/auth/session` →
+  `POST /api/v1/sessions` → WebSocket flow any new participant does,
+  with a fresh session id — analysis resumes, but that one gap's risk
+  history doesn't carry over. `background.js` resets its local detector
+  state at the same point, so the badge doesn't show stale numbers from
+  the now-dead session while this happens.
+- **Exponential backoff with jitter, and a hard cap.** Delay doubles
+  each attempt (1s, 2s, 4s, ... capped at 30s), with up to ±20% random
+  jitter so several participants' retries don't all hit the gateway at
+  the same instant. `RECONNECT_MAX_ATTEMPTS` (8, in `background.js`) —
+  roughly two minutes of total retrying — bounds this; past it,
+  `background.js` gives up for good and reports the same `{type:"error"}`
+  content.js already handles by tearing that one participant down. That
+  gives a real gateway restart a fair chance without retrying forever.
+- **Only an unexpected drop reconnects.** A deliberate stop
+  (`content.js` sending `{type:"stop"}`, or the port itself
+  disconnecting) is tracked separately and never triggers a reconnect —
+  only the WebSocket's own `close` event firing when nothing asked for
+  it does.
+- **Fully isolated per participant.** This logic lives entirely inside
+  the same per-port closure 8.4 already uses for session isolation — no
+  new mechanism was needed for "participant A's reconnect must not
+  affect B." Verified directly (not simulated) against the real gateway:
+  force-closing one simulated participant's WebSocket, and a real
+  `docker restart` of the gateway container mid-session, both reconnect
+  successfully while an unrelated second participant's own connection
+  and message stream are completely undisturbed throughout.
+- While reconnecting, `content.js` shows "Reconnecting… (attempt N)" on
+  that participant's badge (a new `{type:"reconnecting"}` message) but
+  does **not** tear the participant down — their tracked entry, and
+  `tick()`'s own independent video-detection, keep running the whole
+  time, so a successful reconnect just resumes rather than making the
+  participant disappear and reappear as a new tile.
 
 ## Known limitations (by design, for this first pass)
 
@@ -195,14 +240,20 @@ content.js  ──"start"──►  background.js  ──long-lived extension to
   the gateway's.
 - No settings UI yet — gateway URL, extension token, and the
   concurrency cap are all constants in `background.js`/`content.js`.
-- MV3 service workers can be recycled by Chrome; `content.js`'s
-  detection loop will reconnect and restart each affected participant's
-  session automatically the next time it ticks (minting a fresh session
-  credential as part of that, same as any other new session) — other
-  participants' sessions, on independent ports, are unaffected.
-- A participant's session whose WebSocket drops mid-call (network blip,
-  gateway restart) isn't reconnected in place — `content.js` tears that
-  one participant down and will start a brand-new session for them the
-  next time its own detection loop notices they're still there, but
-  there's no dedicated reconnect-in-place path yet. Other participants
-  are unaffected either way.
+- MV3 service workers can be recycled by Chrome; when that happens
+  mid-session, `content.js`'s detection loop will reconnect and restart
+  each affected participant's session automatically the next time it
+  ticks (minting a fresh session credential as part of that, same as
+  any other new session) — other participants' sessions, on independent
+  ports, are unaffected.
+- Reconnecting after a dropped WebSocket (see "How it recovers from
+  disconnects" above) always starts a **new** session — there's no
+  server-side session continuity, so a reconnect's risk history starts
+  over rather than picking up exactly where the old session left off.
+  Building true continuity would mean gateway-side changes (a grace
+  period before finalizing a session, accepting a reconnect to an
+  *existing* session id) that this phase deliberately didn't take on.
+- After `RECONNECT_MAX_ATTEMPTS` (8, ~2 minutes of backoff) fails to
+  reconnect a participant, that participant's session is torn down for
+  good — `content.js`'s own detection loop is what would notice them
+  again and start fresh, same as if they'd genuinely left and rejoined.

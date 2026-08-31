@@ -168,11 +168,12 @@
         // GATEWAY_EXTENSION_TOKEN placeholder, credential exchange
         // failing — logged here (and by background.js itself, see its
         // own console.error) so the failure is at least visible in one
-        // of the two consoles. Phase 8.4: also tears this one
-        // participant down (not stuck showing "Error" forever while
-        // everyone else keeps working) so the next tick's fresh
-        // detection can retry it — full reconnect-of-an-active-session
-        // logic is still out of scope, same as every prior phase.
+        // of the two consoles. Reaching "error" now means background.js
+        // (Phase 8.5) already tried reconnecting with backoff and gave
+        // up for good — so this still tears this one participant down
+        // (not stuck showing "Error" forever while everyone else keeps
+        // working) so the next tick's fresh detection can retry it from
+        // scratch.
         case "error":
           console.error(`MithyaX[${key}]: session error —`, message.message);
           updateBadge(key, { tier: "unknown", label: "Error — see console" });
@@ -182,6 +183,17 @@
           console.warn(`MithyaX[${key}]: gateway session closed.`);
           updateBadge(key, { tier: "unknown", label: "Disconnected" });
           stopParticipant(key);
+          break;
+        // Phase 8.5: an unexpected drop that background.js is actively
+        // retrying (with backoff — see its own RECONNECT_* constants),
+        // not a final failure. Deliberately does NOT call
+        // stopParticipant: this participant's tracked entry (and
+        // tick()'s own independent grace-period video-detection) keeps
+        // running the whole time, so a successful reconnect just resumes
+        // where the badge left off instead of this participant
+        // disappearing and reappearing as a brand-new tile.
+        case "reconnecting":
+          updateBadge(key, { tier: "unknown", label: `Reconnecting… (${message.attempt})` });
           break;
       }
     });
