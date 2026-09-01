@@ -52,6 +52,17 @@
   // badge never affects another's.
   const badges = new Map();
 
+  // Phase 8.11: the pilot's one feedback signal. Registered once by
+  // content.js at startup (mirrors how capture.js exposes plain
+  // functions on window.__mithyax, just in the other direction — this
+  // is ui.js's one callback *into* content.js) rather than content.js
+  // reaching into this file's own badges Map, which stays private to
+  // this file.
+  let feedbackCallback = null;
+  function setFeedbackCallback(fn) {
+    feedbackCallback = fn;
+  }
+
   function ensureBadge(key) {
     const existing = badges.get(key);
     if (existing && document.body.contains(existing.badgeEl)) return existing.badgeEl;
@@ -104,7 +115,43 @@
     reasonsEl.className = "mithyax-details-reasons";
 
     detailsEl.append(descriptionEl, confidenceEl, reasonsEl);
-    badgeEl.append(pillEl, detailsEl);
+
+    // Phase 8.11: only ever shown alongside an actual verdict (see
+    // updateBadge) — asking "was this useful" while still connecting or
+    // reconnecting has nothing for a tester to react to yet.
+    const feedbackEl = document.createElement("div");
+    feedbackEl.className = "mithyax-feedback";
+    feedbackEl.hidden = true;
+
+    const feedbackPromptEl = document.createElement("span");
+    feedbackPromptEl.textContent = "Was this detection useful?";
+
+    const feedbackYesEl = document.createElement("button");
+    feedbackYesEl.type = "button";
+    feedbackYesEl.textContent = "👍 Yes";
+
+    const feedbackNoEl = document.createElement("button");
+    feedbackNoEl.type = "button";
+    feedbackNoEl.textContent = "👎 No";
+
+    feedbackEl.append(feedbackPromptEl, feedbackYesEl, feedbackNoEl);
+
+    // Given at most once per badge — a brand-new badge (a genuinely new
+    // participant/session, per removeBadge deleting this whole entry)
+    // is the only way this is ever asked again.
+    let feedbackGiven = false;
+    function submitFeedback(useful) {
+      if (feedbackGiven) return;
+      feedbackGiven = true;
+      feedbackPromptEl.textContent = "Thanks for the feedback!";
+      feedbackYesEl.hidden = true;
+      feedbackNoEl.hidden = true;
+      feedbackCallback?.(key, useful);
+    }
+    feedbackYesEl.addEventListener("click", () => submitFeedback(true));
+    feedbackNoEl.addEventListener("click", () => submitFeedback(false));
+
+    badgeEl.append(pillEl, detailsEl, feedbackEl);
 
     toggleEl.addEventListener("click", () => {
       detailsEl.hidden = !detailsEl.hidden;
@@ -113,7 +160,7 @@
 
     document.body.appendChild(badgeEl);
 
-    const entry = { badgeEl, dotEl, verdictEl, toggleEl, detailsEl, descriptionEl, confidenceEl, reasonsEl };
+    const entry = { badgeEl, dotEl, verdictEl, toggleEl, detailsEl, descriptionEl, confidenceEl, reasonsEl, feedbackEl };
     badges.set(key, entry);
     return badgeEl;
   }
@@ -142,6 +189,13 @@
       // A hover tooltip mirrors the same details as a zero-click
       // fallback to the click-to-expand panel above.
       b.badgeEl.title = state.description ? `${state.description}${state.confidence == null ? "" : ` (Confidence: ${state.confidence}%)`}` : "";
+
+      // Just unhidden here, never re-populated — submitFeedback (in
+      // ensureBadge) already swapped its own text/buttons to the
+      // "Thanks for the feedback!" state directly, and a later verdict
+      // tick for the same badge must leave that alone rather than
+      // resetting back to the prompt.
+      b.feedbackEl.hidden = false;
     } else {
       b.dotEl.textContent = KIND_EMOJI[kind] || KIND_EMOJI.analyzing;
       b.verdictEl.textContent = kind === "reconnecting" ? `Reconnecting… (${state.attempt})` : KIND_LABEL[kind] || KIND_LABEL.analyzing;
@@ -157,6 +211,9 @@
       b.toggleEl.hidden = true;
       b.detailsEl.hidden = true;
       b.badgeEl.title = "";
+      // Same reasoning as the toggle/details above — nothing to react
+      // to yet, or not anymore (e.g. mid-reconnect).
+      b.feedbackEl.hidden = true;
     }
   }
 
@@ -182,5 +239,5 @@
   }
 
   window.__mithyax = window.__mithyax || {};
-  window.__mithyax.ui = { ensureBadge, updateBadge, removeBadge, positionBadge };
+  window.__mithyax.ui = { ensureBadge, updateBadge, removeBadge, positionBadge, setFeedbackCallback };
 })();

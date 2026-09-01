@@ -64,6 +64,9 @@ top-left of the call showing MithyaX's current read on them:
   and rejoin (or reload the Meet tab) — it only checks your settings
   when it first starts watching someone.
 
+Once you see a verdict, you'll also see a small feedback prompt under
+the badge — feel free to use it.
+
 ## Updating
 
 If you're given a new version of the zip during the pilot: unzip it

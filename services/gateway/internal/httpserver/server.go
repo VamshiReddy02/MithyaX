@@ -278,6 +278,10 @@ func New(cfg config.Config, logger *slog.Logger) (*Server, error) {
 	v1Sessions.Use(ratelimit.Middleware(limiter, "default", defaultRateLimit, logger))
 	v1Sessions.POST("/sessions", handlers.NewCreateSession(liveSessionStore, sessionRepo))
 	v1Sessions.GET("/sessions/ws", handlers.NewSessionWebSocket(liveSessionStore, sessionRepo, analysisRepo, logger))
+	// Phase 8.11: the pilot's one feedback signal ("was this detection
+	// useful") — same session-credential auth as the two routes above,
+	// nothing new to authorize.
+	v1Sessions.POST("/sessions/:id/feedback", handlers.NewSessionFeedback(logger))
 
 	return &Server{
 		HTTP: &http.Server{

@@ -296,6 +296,33 @@ chrome.runtime.onConnect.addListener((port) => {
         if (typeof message.data === "string") session?.sendAudioChunk(message.data);
         break;
 
+      // Phase 8.11: the pilot's one feedback signal — best-effort, not
+      // queued or retried. If there's no live session (already stopped)
+      // or the gateway isn't reachable right now, the click is simply
+      // lost; this is pilot telemetry, not data anything else depends
+      // on. Reuses the same getConfig()/getSessionCredential() helpers
+      // connectSession already uses, and the same session-credential
+      // auth POST /api/v1/sessions/:id/feedback shares with POST
+      // /sessions and /sessions/ws (see internal/httpserver/
+      // sessionauth.go on the gateway side).
+      case "feedback":
+        if (session && typeof message.useful === "boolean") {
+          try {
+            const config = await getConfig();
+            if (config) {
+              const credential = await getSessionCredential(config);
+              await fetch(`${config.gatewayUrl}/api/v1/sessions/${session.sessionId}/feedback`, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${credential}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ useful: message.useful }),
+              });
+            }
+          } catch (err) {
+            console.warn("MithyaX: failed to submit feedback —", err);
+          }
+        }
+        break;
+
       case "stop":
         intentionalStop = true;
         generation++;

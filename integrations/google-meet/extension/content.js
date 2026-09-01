@@ -50,7 +50,7 @@
   const PARTICIPANT_LEFT_DISPLAY_MS = 2500;
 
   const { captureFrameBase64, RemoteAudioCapture } = window.__mithyax.capture;
-  const { updateBadge, removeBadge, positionBadge } = window.__mithyax.ui;
+  const { updateBadge, removeBadge, positionBadge, setFeedbackCallback } = window.__mithyax.ui;
 
   // One entry per remote participant currently being analyzed, keyed by
   // their video track's id. See the Participant shape in
@@ -543,6 +543,19 @@
 
     refreshAudioPairing();
   }
+
+  // Phase 8.11: ui.js knows nothing about ports/sessions — it just
+  // reports which participant key got a 👍/👎 click and forwards it to
+  // whichever background.js instance owns that participant's session.
+  setFeedbackCallback((key, useful) => {
+    const p = participants.get(key);
+    if (!p?.port) return;
+    try {
+      p.port.postMessage({ type: "feedback", useful });
+    } catch {
+      // port already gone — best-effort telemetry, nothing to recover.
+    }
+  });
 
   tickTimer = setInterval(tick, DETECT_INTERVAL_MS);
   positionTimer = setInterval(() => {

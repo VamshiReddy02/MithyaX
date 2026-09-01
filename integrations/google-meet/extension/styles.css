@@ -96,3 +96,33 @@
 .mithyax-details-reasons:empty {
   display: none;
 }
+
+/* Phase 8.11: the pilot's one feedback row. Same dark pill treatment as
+   .mithyax-details, kept separate so it can be shown/hidden
+   independently of the click-to-expand details panel above it. */
+.mithyax-feedback {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 20px;
+  background: rgba(20, 20, 20, 0.85);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.mithyax-feedback button {
+  margin: 0;
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 12px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.mithyax-feedback button:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
